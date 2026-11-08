@@ -147,7 +147,30 @@ export async function syncGsc(site: string, start: Date, end: Date, brandTerms: 
 }
 
 // ---------- Business Profile ----------
-type Loc = { name: string; account: string; title: string };
+type Loc = { name: string; account: string; title: string; address?: string; placeId?: string };
+
+/** One row per profile: name it by city (several profiles can share the same title). */
+const locLabel = (l: Loc) => {
+  const city = gbpLocationOf(l.address || "");
+  return city !== "Untagged" ? city : l.title;
+};
+
+export let gbpWarning = "";
+
+/** Fallback until the My Business v4 reviews API is approved: Places API (New), keyed by API key. */
+async function placesReviews(placeId: string) {
+  const key = process.env.GOOGLE_PLACES_KEY!;
+  const r = await fetch(`https://places.googleapis.com/v1/places/${encodeURIComponent(placeId)}`, {
+    headers: { "X-Goog-Api-Key": key, "X-Goog-FieldMask": "rating,userRatingCount" },
+    cache: "no-store",
+  });
+  const j: any = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    // Never let the key end up in the sync status
+    throw new Error(`${r.status}: ${String(j.error?.message || r.statusText).split(key).join("***").slice(0, 120)}`);
+  }
+  return { count: Number(j.userRatingCount || 0), rating: Number(j.rating || 0) };
+}
 
 const PERF = {
   CALL_CLICKS: "calls",
@@ -162,8 +185,29 @@ const PERF = {
 
 export async function syncGbp(locations: Loc[], start: Date, end: Date) {
   const acc = new Acc();
-  const today = ymd(new Date());
+  const snapDate = ymd(end); // inside the dashboard's "last 28 days" window
+  gbpWarning = "";
+  let placeIdsFound = false;
+  const placesOk: string[] = [];
+  const placesFailed: string[] = [];
+  let v4Error = "";
   for (const loc of locations) {
+    if (!loc.address) {
+      // Locations saved before addresses were stored: look the address up once
+      try {
+        const info: any = await gfetch(`https://mybusinessbusinessinformation.googleapis.com/v1/${loc.name}?readMask=storefrontAddress`);
+        const ad = info.storefrontAddress;
+        loc.address = ad ? [...(ad.addressLines || []), ad.locality].filter(Boolean).join(", ") : "";
+      } catch { /* fall back to the profile title */ }
+    }
+    if (!loc.placeId) {
+      // Needed for the Places API reviews fallback; saved to settings below so it's looked up once
+      try {
+        const info: any = await gfetch(`https://mybusinessbusinessinformation.googleapis.com/v1/${loc.name}?readMask=metadata`);
+        if (info.metadata?.placeId) { loc.placeId = info.metadata.placeId; placeIdsFound = true; }
+      } catch { /* retried on the next sync */ }
+    }
+    const label = locLabel(loc);
     const p = new URLSearchParams();
     Object.keys(PERF).forEach((m) => p.append("dailyMetrics", m));
     p.set("dailyRange.startDate.year", String(start.getFullYear()));
@@ -182,20 +226,51 @@ export async function syncGbp(locations: Loc[], start: Date, end: Date) {
         for (const dv of s.timeSeries?.datedValues || []) {
           const { year, month, day } = dv.date;
           const d = `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
-          acc.add(d, "gbp", metric, loc.title, Number(dv.value || 0));
+          acc.add(d, "gbp", metric, label, Number(dv.value || 0));
         }
       }
     }
-    // Reviews (count and rating) as today's snapshot
+    // Reviews (count and rating) as a snapshot on the last synced day
     try {
       const id = loc.name.split("/")[1];
       const rv: any = await gfetch(`https://mybusiness.googleapis.com/v4/${loc.account}/locations/${id}/reviews?pageSize=1`);
-      acc.set(today, "gbp", "reviews_snap", loc.title, Number(rv.totalReviewCount || 0));
-      acc.set(today, "gbp", "rating_snap", loc.title, Number(rv.averageRating || 0));
-    } catch {
-      /* reviews endpoint needs the same API approval; skip quietly if not available */
+      acc.set(snapDate, "gbp", "reviews_snap", label, Number(rv.totalReviewCount || 0));
+      acc.set(snapDate, "gbp", "rating_snap", label, Number(rv.averageRating || 0));
+    } catch (e: any) {
+      v4Error = String(e.message).slice(0, 120);
+      if (process.env.GOOGLE_PLACES_KEY) {
+        try {
+          if (!loc.placeId) throw new Error("no Place ID");
+          const pr = await placesReviews(loc.placeId);
+          acc.set(snapDate, "gbp", "reviews_snap", label, pr.count);
+          acc.set(snapDate, "gbp", "rating_snap", label, pr.rating);
+          placesOk.push(label);
+        } catch (pe: any) {
+          placesFailed.push(`${label} (${pe.message})`);
+        }
+      }
     }
   }
+  if (placesFailed.length) gbpWarning = `Places API reviews failed for ${placesFailed.join(", ")}`;
+  else if (placesOk.length) gbpWarning = "reviews from Places API";
+  else if (v4Error) gbpWarning = `reviews not available (${v4Error})`;
+
+  if (placeIdsFound) {
+    const { error } = await supabaseAdmin().from("settings").update({ gbp_locations: locations }).eq("id", 1);
+    if (error) gbpWarning += `${gbpWarning ? " · " : ""}couldn't save Place IDs (${error.message})`;
+  }
+  // Replace this date range so rows saved under old profile names disappear.
+  // Review snapshots are only written for one day per sync, so keep earlier ones for current
+  // profiles: "new reviews this week" compares them week to week.
+  const db = supabaseAdmin();
+  const SNAPS = "(reviews_snap,rating_snap)";
+  const labels = `(${locations.map((l) => `"${locLabel(l).replace(/"/g, "")}"`).join(",")})`;
+  const del1 = await db.from("metrics_daily").delete()
+    .eq("source", "gbp").gte("date", ymd(start)).lte("date", ymd(end)).not("metric", "in", SNAPS);
+  const del2 = await db.from("metrics_daily").delete()
+    .eq("source", "gbp").gte("date", ymd(start)).lte("date", ymd(end)).in("metric", ["reviews_snap", "rating_snap"]).not("dim", "in", labels);
+  const error = del1.error || del2.error;
+  if (error) throw new Error(`Clearing old profile rows failed: ${error.message}`);
   const rows = acc.rows();
   await save(rows);
   return rows.length;
@@ -224,7 +299,10 @@ export async function syncAll(days = 35) {
   else log.push("GA4: not set up");
   if (s?.gsc_site_url) await run("Search Console", () => syncGsc(s.gsc_site_url, start, end, s.brand_terms || [], s.tracked_keywords || []));
   else log.push("Search Console: not set up");
-  if (s?.gbp_locations?.length) await run("Business Profile", () => syncGbp(s.gbp_locations, start, end));
+  if (s?.gbp_locations?.length) {
+    await run("Business Profile", () => syncGbp(s.gbp_locations, start, end));
+    if (gbpWarning) log.push(`Business Profile: ${gbpWarning}`);
+  }
   else log.push("Business Profile: no locations chosen");
 
   const status = (ok ? "OK · " : "Problem · ") + log.join(" · ");

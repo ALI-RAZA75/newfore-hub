@@ -1,6 +1,6 @@
 "use client";
 import {
-  Bar, BarChart, CartesianGrid, Layer, Line, LineChart, Rectangle, ResponsiveContainer, Sankey, Tooltip, XAxis, YAxis,
+  Bar, BarChart, CartesianGrid, Layer, Line, LineChart, Rectangle, ReferenceLine, ResponsiveContainer, Sankey, Tooltip, XAxis, YAxis,
 } from "recharts";
 
 export const CHANNEL_COLORS: Record<string, string> = {
@@ -70,11 +70,17 @@ export function Lines({ data, series, height = 240, reversed = false }: {
   );
 }
 
-export function Spark({ values, color = "#F15D26", height = 36 }: { values: (number | null)[]; color?: string; height?: number }) {
+export function Spark({ values, color = "#F15D26", height = 36, target }: {
+  values: (number | null)[]; color?: string; height?: number; target?: number | null;
+}) {
   const data = values.map((v, i) => ({ i, v }));
   return (
     <ResponsiveContainer width="100%" height={height}>
       <LineChart data={data} margin={{ top: 4, right: 4, left: 4, bottom: 4 }}>
+        <YAxis hide domain={["auto", "auto"]} />
+        {target !== undefined && target !== null && (
+          <ReferenceLine y={target} stroke="#6A7179" strokeDasharray="3 3" strokeWidth={1} ifOverflow="extendDomain" />
+        )}
         <Line type="linear" dataKey="v" stroke={color} strokeWidth={2} dot={false} connectNulls isAnimationActive={false} />
       </LineChart>
     </ResponsiveContainer>

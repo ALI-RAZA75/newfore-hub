@@ -1,6 +1,7 @@
 "use server";
 import { revalidatePath } from "next/cache";
 import { getMe, supabaseAdmin, supabaseServer } from "@/lib/supabase-server";
+import { GOAL_DATE, GOAL_SOURCE, MANUAL_SOURCE, SCORECARD } from "@/lib/scorecard";
 
 type Res = { ok: true } | { ok: false; error: string };
 const fail = (e: unknown): Res => ({ ok: false, error: e instanceof Error ? e.message : String(e) });
@@ -105,7 +106,6 @@ export async function saveGoal(fd: FormData): Promise<Res> {
       metric_key: clean(fd.get("metric_key")),
       baseline: num("baseline") ?? 0,
       target: num("target") ?? 0,
-      target_high: num("target_high"),
       lower_is_better: fd.get("lower_is_better") === "on",
       manual_value: num("manual_value"),
     };
@@ -120,6 +120,50 @@ export async function deleteGoal(id: string): Promise<Res> {
     const { error } = await supabaseServer().from("goals").delete().eq("id", id);
     if (error) throw error;
     return done("/plans");
+  } catch (e) { return fail(e); }
+}
+
+// ---------- Weekly scorecard ----------
+// metrics_daily is written by the server only (no RLS write policies), so these use the service role.
+const scoreValue = (v: string) => {
+  const s = v.trim();
+  if (s === "") return null;
+  const n = Number(s);
+  if (!Number.isFinite(n)) throw new Error("Enter a number.");
+  return n;
+};
+
+/** Anyone on the team can enter a manual weekly number. Empty clears it. */
+export async function saveScoreValue(week: string, key: string, value: string): Promise<Res> {
+  try {
+    const me = await getMe();
+    if (!me) throw new Error("Sign in first.");
+    if (!SCORECARD.some((m) => m.key === key && m.manual)) throw new Error("That number is filled in automatically.");
+    const d = new Date(week + "T00:00:00");
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(week) || Number.isNaN(d.getTime()) || d.getDay() !== 1) throw new Error("Pick a week starting on a Monday.");
+    const n = scoreValue(value);
+    const db = supabaseAdmin().from("metrics_daily");
+    const { error } = n === null
+      ? await db.delete().match({ date: week, source: MANUAL_SOURCE, metric: key, dim: "" })
+      : await db.upsert({ date: week, source: MANUAL_SOURCE, metric: key, dim: "", value: n }, { onConflict: "date,source,metric,dim" });
+    if (error) throw error;
+    return done("/");
+  } catch (e) { return fail(e); }
+}
+
+/** Admins set the weekly goal for each measurable. Empty clears it. */
+export async function saveScoreGoal(key: string, value: string): Promise<Res> {
+  try {
+    const me = await getMe();
+    if (me?.role !== "admin") throw new Error("Only admins can change scorecard goals.");
+    if (!SCORECARD.some((m) => m.key === key)) throw new Error("Unknown measurable.");
+    const n = scoreValue(value);
+    const db = supabaseAdmin().from("metrics_daily");
+    const { error } = n === null
+      ? await db.delete().match({ date: GOAL_DATE, source: GOAL_SOURCE, metric: key, dim: "" })
+      : await db.upsert({ date: GOAL_DATE, source: GOAL_SOURCE, metric: key, dim: "", value: n }, { onConflict: "date,source,metric,dim" });
+    if (error) throw error;
+    return done("/");
   } catch (e) { return fail(e); }
 }
 

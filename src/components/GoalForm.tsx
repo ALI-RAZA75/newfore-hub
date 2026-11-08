@@ -4,11 +4,13 @@ import { useRouter } from "next/navigation";
 import { Pencil, Plus } from "lucide-react";
 import Modal from "./Modal";
 import { deleteGoal, saveGoal } from "@/app/actions";
+import { Agg, AGG_TEXT } from "@/lib/goals";
 
-export default function GoalForm({ planId, metrics, goal }: { planId: string; metrics: { key: string; label: string }[]; goal?: any }) {
+export default function GoalForm({ planId, metrics, goal }: { planId: string; metrics: { key: string; label: string; agg: Agg }[]; goal?: any }) {
   const [open, setOpen] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [metric, setMetric] = useState<string>(goal?.metric_key || "");
+  const agg = metrics.find((m) => m.key === metric)?.agg;
   const router = useRouter();
   return (
     <>
@@ -34,10 +36,13 @@ export default function GoalForm({ planId, metrics, goal }: { planId: string; me
                 {metrics.map((m) => <option key={m.key} value={m.key}>{m.label} (live)</option>)}
               </select>
             </div>
-            <div className="grid grid-cols-3 gap-3">
-              <div><label className="label" htmlFor="g-base">Start</label><input id="g-base" name="baseline" type="number" step="any" className="input" required defaultValue={goal?.baseline ?? 0} /></div>
-              <div><label className="label" htmlFor="g-t">Goal</label><input id="g-t" name="target" type="number" step="any" className="input" required defaultValue={goal?.target} /></div>
-              <div><label className="label" htmlFor="g-th">Goal (top)</label><input id="g-th" name="target_high" type="number" step="any" className="input" placeholder="optional" defaultValue={goal?.target_high ?? ""} /></div>
+            <div className="grid grid-cols-2 gap-3">
+              <div><label className="label" htmlFor="g-base">Start (weekly)</label><input id="g-base" name="baseline" type="number" step="any" className="input" required defaultValue={goal?.baseline ?? 0} /></div>
+              <div>
+                <label className="label" htmlFor="g-t">Weekly target</label>
+                <input id="g-t" name="target" type="number" step="any" className="input" required defaultValue={goal?.target} aria-describedby="g-kind" />
+                <p id="g-kind" className="mt-1 text-xs text-ink-muted">{agg ? AGG_TEXT[agg] : "entered by hand"}</p>
+              </div>
             </div>
             {!metric && <div><label className="label" htmlFor="g-m">Current value</label><input id="g-m" name="manual_value" type="number" step="any" className="input" defaultValue={goal?.manual_value ?? ""} /></div>}
             <label className="flex items-center gap-2 text-sm"><input type="checkbox" name="lower_is_better" defaultChecked={goal?.lower_is_better} /> Lower is better (like a ranking)</label>

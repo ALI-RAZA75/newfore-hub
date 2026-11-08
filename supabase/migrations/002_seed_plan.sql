@@ -9,16 +9,17 @@ begin
           '2026-10-26', '2027-01-31', 'active')
   returning id into p;
 
-  insert into public.goals (plan_id, label, metric_key, baseline, target, target_high, lower_is_better, sort) values
-    (p, 'Visitors from AI assistants', 'ai_sessions_28d', 6, 40, 60, false, 1),
-    (p, 'AI platforms sending visitors', 'ai_platforms_28d', 1, 2, null, false, 2),
-    (p, 'Leads from AI', 'ai_leads_28d', 1, 3, null, false, 3),
-    (p, 'Google views on question-style searches', 'question_impressions_28d', 3327, 4000, 6000, false, 4),
-    (p, 'Average ranking on question searches', 'question_position_28d', 13, 3, 1, true, 5),
-    (p, 'Key searches in the top 5 (of 4)', 'top5_keywords', 1, 3, null, false, 6),
-    (p, 'Clicks from people searching Newfore', 'brand_clicks_28d', 59, 100, null, false, 7),
-    (p, 'Clicks from non-brand searches', 'nonbrand_clicks_28d', 42, 60, null, false, 8),
-    (p, 'Google reviews, all locations', 'gbp_reviews_total', 170, 190, null, false, 9);
+  -- Weekly baselines and targets (sums are per Monday–Sunday week; rankings and review totals are levels)
+  insert into public.goals (plan_id, label, metric_key, baseline, target, lower_is_better, sort) values
+    (p, 'Visitors from AI assistants', 'ai_sessions_28d', 2, 15, false, 1),
+    (p, 'AI platforms sending visitors', 'ai_platforms_28d', 1, 2, false, 2),
+    (p, 'Leads from AI', 'ai_leads_28d', 1, 1, false, 3),
+    (p, 'Google views on question-style searches', 'question_impressions_28d', 832, 1500, false, 4),
+    (p, 'Average ranking on question searches', 'question_position_28d', 13, 1, true, 5),
+    (p, 'Key searches in the top 5 (of 4)', 'top5_keywords', 1, 3, false, 6),
+    (p, 'Clicks from people searching Newfore', 'brand_clicks_28d', 15, 25, false, 7),
+    (p, 'Clicks from non-brand searches', 'nonbrand_clicks_28d', 11, 15, false, 8),
+    (p, 'Google reviews, all locations', 'gbp_reviews_total', 170, 190, false, 9);
 
   insert into public.tasks (plan_id, title, description, area, priority, status, due_date, sort)
   select p, v.title, v.description, v.area, v.priority, v.status, v.due::date, v.sort from (values

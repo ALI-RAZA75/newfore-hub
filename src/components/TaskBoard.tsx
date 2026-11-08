@@ -37,14 +37,18 @@ function Prio({ p }: { p: string }) {
 }
 
 export default function TaskBoard({
-  tasks, people, plans, meId, isAdmin, planId, initialView = "board",
+  tasks, people, plans, meId, isAdmin, planId, initialView = "board", week,
 }: {
   tasks: Task[]; people: Person[]; plans: PlanLite[]; meId: string; isAdmin: boolean; planId?: string; initialView?: "board" | "list" | "week";
+  /** Monday (yyyy-MM-dd) the "By week" view opens on; all weeks when not given. */
+  week?: string;
 }) {
   const router = useRouter();
   const [items, setItems] = useState(tasks);
   useEffect(() => setItems(tasks), [tasks]);
   const [view, setView] = useState(initialView);
+  const [weekShown, setWeekShown] = useState(week || "all");
+  useEffect(() => setWeekShown(week || "all"), [week]);
   const [q, setQ] = useState("");
   const [who, setWho] = useState("all");
   const [prio, setPrio] = useState("all");
@@ -108,6 +112,12 @@ export default function TaskBoard({
             {plans.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
           </select>
         )}
+        {view === "week" && week && (
+          <select className="input w-auto" value={weekShown} onChange={(e) => setWeekShown(e.target.value)} aria-label="Week">
+            <option value={week}>Week of {format(parseISO(week), "MMM d")}</option>
+            <option value="all">All weeks</option>
+          </select>
+        )}
         <label className="flex items-center gap-2 text-sm text-ink-muted">
           <input type="checkbox" checked={hideDone} onChange={(e) => setHideDone(e.target.checked)} /> Hide done
         </label>
@@ -163,6 +173,7 @@ export default function TaskBoard({
             </thead>
             {(view === "week"
               ? groupBy(shown, (t) => (t.due_date ? format(startOfWeek(parseISO(t.due_date), { weekStartsOn: 1 }), "yyyy-MM-dd") : "none"))
+                .filter(([g]) => weekShown === "all" || g === weekShown)
               : [["all", shown] as [string, Task[]]]
             ).map(([g, rows]) => (
               <tbody key={g}>
@@ -193,6 +204,9 @@ export default function TaskBoard({
             ))}
           </table>
           {!shown.length && <p className="p-8 text-center text-sm text-ink-muted">No tasks match these filters.</p>}
+          {!!shown.length && view === "week" && weekShown !== "all" && !shown.some((t) => t.due_date && format(startOfWeek(parseISO(t.due_date), { weekStartsOn: 1 }), "yyyy-MM-dd") === weekShown) && (
+            <p className="p-8 text-center text-sm text-ink-muted">No tasks due this week. Choose “All weeks” to see the rest.</p>
+          )}
         </div>
       )}
 

@@ -4,7 +4,7 @@ import { useRouter } from "next/navigation";
 import { saveSettings } from "@/app/actions";
 
 type Opt<T> = { ok: true; data: T } | { ok: false; error: string };
-type Loc = { name: string; account: string; title: string; address?: string };
+type Loc = { name: string; account: string; title: string; address?: string; placeId?: string };
 
 export default function DataSources({ settings, connected }: { settings: any; connected: boolean }) {
   const [opts, setOpts] = useState<{ ga4: Opt<{ id: string; name: string }[]>; gsc: Opt<string[]>; gbp: Opt<Loc[]> } | null>(null);
@@ -17,7 +17,7 @@ export default function DataSources({ settings, connected }: { settings: any; co
   }, [connected]);
 
   const toggle = (l: Loc) =>
-    setLocs((xs) => (xs.some((x) => x.name === l.name) ? xs.filter((x) => x.name !== l.name) : [...xs, { name: l.name, account: l.account, title: l.title }]));
+    setLocs((xs) => (xs.some((x) => x.name === l.name) ? xs.filter((x) => x.name !== l.name) : [...xs, { name: l.name, account: l.account, title: l.title, address: l.address, placeId: l.placeId }]));
 
   return (
     <form className="flex flex-col gap-5" onSubmit={async (e) => {
