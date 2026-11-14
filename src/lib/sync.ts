@@ -259,17 +259,11 @@ export async function syncGbp(locations: Loc[], start: Date, end: Date) {
     const { error } = await supabaseAdmin().from("settings").update({ gbp_locations: locations }).eq("id", 1);
     if (error) gbpWarning += `${gbpWarning ? " · " : ""}couldn't save Place IDs (${error.message})`;
   }
-  // Replace this date range so rows saved under old profile names disappear.
-  // Review snapshots are only written for one day per sync, so keep earlier ones for current
-  // profiles: "new reviews this week" compares them week to week.
-  const db = supabaseAdmin();
-  const SNAPS = "(reviews_snap,rating_snap)";
-  const labels = `(${locations.map((l) => `"${locLabel(l).replace(/"/g, "")}"`).join(",")})`;
-  const del1 = await db.from("metrics_daily").delete()
-    .eq("source", "gbp").gte("date", ymd(start)).lte("date", ymd(end)).not("metric", "in", SNAPS);
-  const del2 = await db.from("metrics_daily").delete()
-    .eq("source", "gbp").gte("date", ymd(start)).lte("date", ymd(end)).in("metric", ["reviews_snap", "rating_snap"]).not("dim", "in", labels);
-  const error = del1.error || del2.error;
+  // Replace this date range so daily figures saved under old profile names disappear.
+  // Review snapshots are never deleted: each sync adds one per location (dated the last synced
+  // day, so a daily sync gives one a day), and "new reviews" compares them over time.
+  const { error } = await supabaseAdmin().from("metrics_daily").delete()
+    .eq("source", "gbp").gte("date", ymd(start)).lte("date", ymd(end)).not("metric", "in", "(reviews_snap,rating_snap)");
   if (error) throw new Error(`Clearing old profile rows failed: ${error.message}`);
   const rows = acc.rows();
   await save(rows);

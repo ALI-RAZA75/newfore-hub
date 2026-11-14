@@ -180,6 +180,46 @@ export function goalWeekly(g: Goal, w: Weeks, keywords: string[], plan?: { start
   };
 }
 
+// ---------- Review count history (daily reviews_snap per location) ----------
+export type Snap = { date: string; dim: string; value: number };
+
+/** Every review-count snapshot, oldest first (a few rows per day, so this stays small). */
+export async function reviewSnaps(): Promise<Snap[]> {
+  const sb = supabaseServer();
+  const out: Snap[] = [];
+  for (let from = 0; ; from += 1000) {
+    const { data, error } = await sb.from("metrics_daily").select("date,dim,value")
+      .eq("source", "gbp").eq("metric", "reviews_snap").order("date").range(from, from + 999);
+    if (error) throw new Error(error.message);
+    out.push(...(data || []).map((r: any) => ({ date: r.date as string, dim: r.dim as string, value: Number(r.value) })));
+    if (!data || data.length < 1000) break;
+  }
+  return out;
+}
+
+/**
+ * Reviews gained over the 28 days to the latest snapshot on or before `asOf`. Compares with the
+ * snapshot 28 days earlier (or the nearest before it); until one exists, with the oldest snapshot
+ * (`fallback`). `strict` returns null instead of falling back.
+ */
+export function reviews28(snaps: Snap[], loc: string, asOf: string, strict = false) {
+  const mine = snaps.filter((s) => s.dim === loc && s.date <= asOf);
+  const now = mine[mine.length - 1];
+  if (!now) return null;
+  const cutoff = format(subDays(new Date(now.date + "T00:00:00"), 28), "yyyy-MM-dd");
+  const earlier = mine.filter((s) => s.date <= cutoff);
+  const fallback = earlier.length === 0;
+  if (fallback && strict) return null;
+  const past = fallback ? mine[0] : earlier[earlier.length - 1];
+  return { now: now.value, past: past === now ? null : past.value, pastDate: past.date, fallback, diff: past === now ? null : now.value - past.value };
+}
+
+/** All locations' 28-day gain added up; null when no location has a strict 28-day comparison. */
+export function reviews28All(snaps: Snap[], locs: string[], asOf: string) {
+  const diffs = locs.map((l) => reviews28(snaps, l, asOf, true)?.diff).filter((n): n is number => n !== null && n !== undefined);
+  return diffs.length ? diffs.reduce((s, n) => s + n, 0) : null;
+}
+
 /** Reviews gained between two weeks' latest snapshots, per location; null when either week has none. */
 export function newReviews(cur: MRow[], prev: MRow[], loc: string) {
   const a = snap(cur, "reviews_snap", loc), b = snap(prev, "reviews_snap", loc);

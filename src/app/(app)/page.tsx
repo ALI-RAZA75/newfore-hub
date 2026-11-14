@@ -2,10 +2,12 @@ import Link from "next/link";
 import { addDays, format, formatDistanceToNow } from "date-fns";
 import { getMe, supabaseServer } from "@/lib/supabase-server";
 import {
-  byDim, goalWeekly, loadWeeks, METRICS, MRow, newReviews, newReviewsAll, pick, rowsFor, snap, SPARK_WEEKS, weekLabel, window28,
+  byDim, goalWeekly, loadWeeks, METRICS, MRow, newReviews, newReviewsAll, pick, reviews28, reviews28All, reviewSnaps, rowsFor, snap, SPARK_WEEKS,
+  weekLabel, window28,
 } from "@/lib/metrics";
 import { CHANNELS } from "@/lib/classify";
 import { GOAL_SOURCE, MANUAL_SOURCE, SCORECARD } from "@/lib/scorecard";
+import { weekEndOf } from "@/lib/goals";
 import Kpi, { Delta, fmtNum } from "@/components/Kpi";
 import LiveNow from "@/components/LiveNow";
 import SyncButton from "@/components/SyncButton";
@@ -18,6 +20,22 @@ export const dynamic = "force-dynamic";
 
 const SCORE_WEEKS = 8;
 
+/** Sum of the numbers present; null when there are none. */
+const sumOf = (xs: (number | null | undefined)[]) => {
+  const ns = xs.filter((n): n is number => n !== null && n !== undefined);
+  return ns.length ? ns.reduce((s, n) => s + n, 0) : null;
+};
+
+/** +/- badge for reviews gained: green up, red down. */
+function NewBadge({ n }: { n: number | null }) {
+  if (n === null) return <span className="text-ink-muted">—</span>;
+  return (
+    <span className={n > 0 ? "chip bg-emerald-50 text-emerald-700" : n < 0 ? "chip bg-red-50 text-red-700" : "chip bg-paper text-ink-muted"}>
+      {n > 0 ? "+" : ""}{fmtNum(n)}
+    </span>
+  );
+}
+
 export default async function Performance({ searchParams }: { searchParams: { week?: string } }) {
   const me = await getMe();
   const sb = supabaseServer();
@@ -29,9 +47,10 @@ export default async function Performance({ searchParams }: { searchParams: { we
   const w = await loadWeeks(searchParams.week);
   const { options, sel, mondays, days, curWin, prevWin, cur, prev } = w;
   const weekRows = w.rows;
-  const [d28, goalRows] = await Promise.all([
+  const [d28, goalRows, snaps] = await Promise.all([
     rowsFor(window28(curWin)),
     sb.from("metrics_daily").select("metric,value").eq("source", GOAL_SOURCE).then((r) => r.data || []),
+    reviewSnaps(),
   ]);
   const lastWeekFull = weekRows[SPARK_WEEKS - 1];
   const sparkRows = weekRows.slice(1);
@@ -49,7 +68,8 @@ export default async function Performance({ searchParams }: { searchParams: { we
   const has = (rows: MRow[], source: string) => rows.some((r) => r.source === source);
 
   // Weekly scorecard: last 8 weeks ending with the selected week
-  const scoreFn: Record<string, (rows: MRow[], before: MRow[]) => number | null> = {
+  const snapLocs = (rows: MRow[]) => [...new Set(rows.filter((r) => r.source === "gbp" && r.metric === "reviews_snap").map((r) => r.dim))];
+  const scoreFn: Record<string, (rows: MRow[], before: MRow[], mon: string) => number | null> = {
     leads: (r) => (has(r, "ga4") ? pick(r, "ga4", "leads") : null),
     organic_sessions: (r) => (has(r, "ga4") ? pick(r, "ga4", "sessions", "Organic Search") : null),
     gsc_clicks: (r) => (has(r, "gsc") ? pick(r, "gsc", "clicks", "all") : null),
@@ -57,6 +77,8 @@ export default async function Performance({ searchParams }: { searchParams: { we
     ai_sessions: (r) => (has(r, "ga4") ? pick(r, "ga4", "ai_sessions") : null),
     gbp_actions: (r) => (has(r, "gbp") ? profileActions(r) : null),
     new_reviews: (r, before) => newReviewsAll(r, before),
+    // Strict 28 days to the week's end: blank until 28 days of snapshots exist
+    new_reviews_28d: (r, _before, mon) => reviews28All(snaps, snapLocs(r), weekEndOf(mon)),
   };
   const manual = (rows: MRow[], key: string) => rows.find((r) => r.source === MANUAL_SOURCE && r.metric === key)?.value ?? null;
   const scoreIdx = Array.from({ length: SCORE_WEEKS }, (_, i) => SPARK_WEEKS - SCORE_WEEKS + 1 + i);
@@ -64,7 +86,7 @@ export default async function Performance({ searchParams }: { searchParams: { we
   const scoreRows: ScoreRow[] = SCORECARD.map((m) => ({
     ...m,
     goal: goalRows.find((g: any) => g.metric === m.key)?.value ?? null,
-    values: scoreIdx.map((i) => (m.manual ? manual(weekRows[i], m.key) : scoreFn[m.key](weekRows[i], weekRows[i - 1]))),
+    values: scoreIdx.map((i) => (m.manual ? manual(weekRows[i], m.key) : scoreFn[m.key](weekRows[i], weekRows[i - 1], w.isos[i]))),
   }));
 
   // Weekly visits by channel
@@ -92,6 +114,25 @@ export default async function Performance({ searchParams }: { searchParams: { we
     [...byDim(rows, "ga4", "gbp_sessions").entries()]
       .filter(([k]) => l.toLowerCase().includes(k.toLowerCase()) || k.toLowerCase().includes(l.toLowerCase().split(" ")[0]))
       .reduce((sum, [, n]) => sum + n, 0);
+  // Reviews gained over 28 days, per location, as of the end of the selected week
+  const reviewsAsOf = weekEndOf(sel.iso);
+  const rev28 = (() => {
+    const byLoc = new Map(locNames.map((l) => [l, reviews28(snaps, l, reviewsAsOf)] as const));
+    const fallbackDates = [...new Set([...byLoc.values()].filter((r) => r?.fallback && r.past !== null).map((r) => r!.pastDate))].sort();
+    return {
+      byLoc,
+      anyFallback: fallbackDates.length > 0,
+      mixedDates: fallbackDates.length > 1,
+      sinceLabel: fallbackDates.length ? format(new Date(fallbackDates[0] + "T00:00:00"), "MMM d") : "",
+    };
+  })();
+  const ratingAll = (() => {
+    const both = locNames
+      .map((l) => ({ n: snap(cur, "reviews_snap", l), r: snap(cur, "rating_snap", l) }))
+      .filter((x): x is { n: number; r: number } => x.n !== null && x.r !== null && x.n > 0 && x.r > 0);
+    const total = both.reduce((s, x) => s + x.n, 0);
+    return total ? both.reduce((s, x) => s + x.r * x.n, 0) / total : null;
+  })();
   const mapsCols: { label: string; fn: (rows: MRow[], l: string) => number }[] = [
     { label: "Profile views", fn: (r, l) => pick(r, "gbp", "views", l) },
     { label: "Calls", fn: (r, l) => pick(r, "gbp", "calls", l) },
@@ -245,20 +286,26 @@ export default async function Performance({ searchParams }: { searchParams: { we
         <h2 className="card-title">Google Maps, by location</h2>
         <p className="muted mb-3 text-xs">
           Selected week from the Business Profile API, with the change vs the week before. “Site visits” are GA4 sessions tagged with each profile’s UTM link.
-          “New this week” is the latest review count this week minus last week’s.
+          “New this week” is the latest review count this week minus last week’s. “Reviews now” is the latest count by the end of the selected week,
+          compared with the count 28 days before it{rev28.anyFallback ? ", or with the oldest count we have until 28 days of history exist" : ""}.
         </p>
         <div className="overflow-x-auto">
-          <table className="w-full min-w-[900px] text-sm tnum">
+          <table className="w-full min-w-[1100px] text-sm tnum">
             <thead>
               <tr className="text-left text-xs text-ink-muted">
                 <th className="py-2">Location</th>
                 {mapsCols.map((c) => <th key={c.label} className="text-right">{c.label}</th>)}
-                <th className="text-right">Reviews</th><th className="text-right">New this week</th><th className="text-right">Rating</th>
+                <th className="text-right">Reviews now</th>
+                <th className="text-right">{rev28.anyFallback ? `Since ${rev28.sinceLabel}` : "28 days ago"}</th>
+                <th className="text-right">{rev28.anyFallback ? `New since ${rev28.sinceLabel}` : "New (28 days)"}</th>
+                <th className="text-right">New this week</th><th className="text-right">Rating</th>
               </tr>
             </thead>
             <tbody>
               {locNames.length ? locNames.map((l) => {
                 const nr = newReviews(cur, lastWeekFull, l);
+                const r = rev28.byLoc.get(l);
+                const odd = r && r.fallback && rev28.mixedDates;
                 return (
                   <tr key={l} className="border-t border-paper-line align-top">
                     <td className="py-2 font-semibold">{l}</td>
@@ -268,13 +315,37 @@ export default async function Performance({ searchParams }: { searchParams: { we
                         <div className="mt-0.5"><Delta cur={c.fn(cur, l)} prev={c.fn(prev, l)} /></div>
                       </td>
                     ))}
-                    <td className="py-2 text-right">{fmtNum(snap(cur, "reviews_snap", l))}</td>
+                    <td className="py-2 text-right">{fmtNum(r?.now ?? null)}</td>
+                    <td className="py-2 text-right text-ink-muted">
+                      {fmtNum(r?.past ?? null)}
+                      {odd && <div className="text-[11px]">{format(new Date(r!.pastDate + "T00:00:00"), "MMM d")}</div>}
+                    </td>
+                    <td className="py-2 text-right"><NewBadge n={r?.diff ?? null} /></td>
                     <td className="py-2 text-right">{nr === null ? "—" : `${nr > 0 ? "+" : ""}${fmtNum(nr)}`}</td>
                     <td className="py-2 text-right">{fmtNum(snap(cur, "rating_snap", l), 1)}</td>
                   </tr>
                 );
               }) : (
-                <tr><td colSpan={mapsCols.length + 4} className="py-6 text-center text-ink-muted">No Maps data for this week. Choose your locations in Settings (needs Business Profile API access).</td></tr>
+                <tr><td colSpan={mapsCols.length + 6} className="py-6 text-center text-ink-muted">No Maps data for this week. Choose your locations in Settings (needs Business Profile API access).</td></tr>
+              )}
+              {locNames.length > 1 && (
+                <tr className="border-t-2 border-ink/20 align-top font-semibold">
+                  <td className="py-2">Total</td>
+                  {mapsCols.map((c) => {
+                    const a = sumOf(locNames.map((l) => c.fn(cur, l))), b = sumOf(locNames.map((l) => c.fn(prev, l)));
+                    return (
+                      <td key={c.label} className="py-2 text-right">
+                        <div>{fmtNum(a)}</div>
+                        <div className="mt-0.5 font-normal"><Delta cur={a} prev={b} /></div>
+                      </td>
+                    );
+                  })}
+                  <td className="py-2 text-right">{fmtNum(sumOf(locNames.map((l) => rev28.byLoc.get(l)?.now ?? null)))}</td>
+                  <td className="py-2 text-right text-ink-muted">{fmtNum(sumOf(locNames.map((l) => rev28.byLoc.get(l)?.past ?? null)))}</td>
+                  <td className="py-2 text-right"><NewBadge n={sumOf(locNames.map((l) => rev28.byLoc.get(l)?.diff ?? null))} /></td>
+                  <td className="py-2 text-right">{(() => { const n = sumOf(locNames.map((l) => newReviews(cur, lastWeekFull, l))); return n === null ? "—" : `${n > 0 ? "+" : ""}${fmtNum(n)}`; })()}</td>
+                  <td className="py-2 text-right" title="Average weighted by each location's review count">{fmtNum(ratingAll, 1)}</td>
+                </tr>
               )}
             </tbody>
           </table>

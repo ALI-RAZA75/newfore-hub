@@ -29,7 +29,7 @@ export default function Login() {
   }
 
   return (
-    <main className="grid min-h-screen place-items-center bg-ink p-4">
+    <main className="flex min-h-screen flex-col items-center justify-center bg-ink p-4">
       <form onSubmit={submit} className="w-full max-w-sm space-y-4 rounded-2xl bg-white p-8 shadow-xl">
         <div>
           <p className="font-display text-2xl font-extrabold">
@@ -55,6 +55,9 @@ export default function Login() {
         </button>
         {msg && <p className="rounded-lg bg-paper p-3 text-sm">{msg}</p>}
       </form>
+      <footer className="mt-4 text-center text-xs text-white/70">
+        <a href="/privacy" className="hover:text-white hover:underline">Privacy</a> · <a href="/terms" className="hover:text-white hover:underline">Terms</a>
+      </footer>
     </main>
   );
 }
