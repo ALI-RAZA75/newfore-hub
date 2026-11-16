@@ -16,8 +16,17 @@ export type Goal = {
   lower_is_better: boolean; manual_value: number | null;
 };
 
-/** The week a goal is judged on. Dates are yyyy-MM-dd. */
-export type WeekCtx = { weekStart: string; days: number; planStart?: string; planEnd?: string };
+/**
+ * The period a goal is judged on: it starts `weekStart` (yyyy-MM-dd), lasts `len` days (7 by default;
+ * 28 for "Last 28 days") and has data for `days` of them so far.
+ */
+export type WeekCtx = { weekStart: string; days: number; len?: number; planStart?: string; planEnd?: string };
+
+const lenOf = (ctx: WeekCtx) => ctx.len ?? 7;
+
+/** The target for the whole period: weekly "sum" targets scale with its length (×4 for 28 days); others don't. */
+export const periodTarget = (goal: Goal, agg: Agg | null, ctx: WeekCtx) =>
+  agg === "sum" ? Number(goal.target) * (lenOf(ctx) / 7) : Number(goal.target);
 
 const day = (s: string) => new Date(s + "T00:00:00").getTime();
 const clamp = (n: number) => Math.max(0, Math.min(1, n));
@@ -28,17 +37,20 @@ const clamp = (n: number) => Math.max(0, Math.min(1, n));
  */
 export const isRate = (agg: Agg | null) => agg === "sum" || agg === "count";
 
-/** Share of the way from baseline to target we should be at by the end of this week. */
+/**
+ * Rate goals: share of the period's target due by now (days so far ÷ period length for sums).
+ * Level goals: share of the way from baseline to target we should be by the end of the period.
+ */
 export function expectedShare(agg: Agg | null, ctx: WeekCtx) {
-  if (isRate(agg)) return agg === "sum" ? ctx.days / 7 : ctx.days > 0 ? 1 : 0;
+  if (isRate(agg)) return agg === "sum" ? ctx.days / lenOf(ctx) : ctx.days > 0 ? 1 : 0;
   if (!ctx.planStart || !ctx.planEnd) return 1;
-  const s = day(ctx.planStart), e = day(ctx.planEnd), end = addDays(new Date(day(ctx.weekStart)), 7).getTime();
+  const s = day(ctx.planStart), e = day(ctx.planEnd), end = addDays(new Date(day(ctx.weekStart)), lenOf(ctx)).getTime();
   return e > s ? clamp((end - s) / (e - s)) : 1;
 }
 
-/** The value that counts as on target for this week. */
+/** The value that counts as on target for this period. */
 export function expectedValue(goal: Goal, agg: Agg | null, ctx: WeekCtx) {
-  const base = Number(goal.baseline), tgt = Number(goal.target);
+  const base = Number(goal.baseline), tgt = periodTarget(goal, agg, ctx);
   return isRate(agg) ? tgt * expectedShare(agg, ctx) : base + (tgt - base) * expectedShare(agg, ctx);
 }
 
@@ -48,14 +60,14 @@ export function onTarget(goal: Goal, agg: Agg | null, value: number | null, ctx:
   return goal.lower_is_better ? value <= exp : value >= exp;
 }
 
-/** The first two weeks of a plan (and any week before it starts) are too early to call someone behind. */
+/** A period ending within a plan's first two weeks (or before it starts) is too early to call anyone behind. */
 export function tooEarly(ctx: WeekCtx) {
   if (!ctx.planStart) return false;
-  return day(ctx.weekStart) < addDays(new Date(day(ctx.planStart)), 14).getTime();
+  return addDays(new Date(day(ctx.weekStart)), lenOf(ctx)).getTime() <= addDays(new Date(day(ctx.planStart)), 14).getTime();
 }
 
 export function goalStatus(goal: Goal, agg: Agg | null, value: number | null, ctx: WeekCtx) {
-  const base = Number(goal.baseline), tgt = Number(goal.target);
+  const base = Number(goal.baseline), tgt = periodTarget(goal, agg, ctx);
   const pace = expectedShare(agg, ctx);
   if (value === null || value === undefined || ctx.days === 0) return { pct: 0, pace, label: "Waiting for data", tone: "muted" as const };
   // Rate goals fill up from zero to the weekly target; level goals (and anything lower-is-better)

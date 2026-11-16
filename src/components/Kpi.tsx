@@ -23,10 +23,14 @@ export function Delta({ cur, prev, lowerIsBetter = false }: { cur: number | null
 }
 
 export default function Kpi({
-  label, cur, prev, spark, color = "#F15D26", decimals = 0, lowerIsBetter = false, note,
+  label, cur, prev, spark, color = "#F15D26", decimals = 0, lowerIsBetter = false, note, prevLabel = "Week before", dates,
 }: {
   label: string; cur: number | null; prev: number | null; spark: (number | null)[]; color?: string;
   decimals?: number; lowerIsBetter?: boolean; note?: string;
+  /** Name of the comparison period, e.g. "Previous 28 days". */
+  prevLabel?: string;
+  /** The dates the figure covers, e.g. "Nov 9–15 vs Nov 2–8". */
+  dates?: string;
 }) {
   return (
     <div className="card flex min-w-0 flex-col gap-2">
@@ -35,7 +39,8 @@ export default function Kpi({
         <p className="font-display text-3xl font-extrabold tnum">{fmtNum(cur, decimals)}</p>
         <Delta cur={cur} prev={prev} lowerIsBetter={lowerIsBetter} />
       </div>
-      <p className="text-xs text-ink-muted tnum">Week before: {fmtNum(prev, decimals)}{note ? ` · ${note}` : ""}</p>
+      <p className="text-xs text-ink-muted tnum">{prevLabel}: {fmtNum(prev, decimals)}{note ? ` · ${note}` : ""}</p>
+      {dates && <p className="text-[11px] text-ink-muted tnum">{dates}</p>}
       <Spark values={spark} color={color} />
     </div>
   );

@@ -1,28 +1,29 @@
 import Link from "next/link";
 import { format, parseISO } from "date-fns";
 import { getMe, supabaseServer } from "@/lib/supabase-server";
-import { goalWeekly, loadWeeks } from "@/lib/metrics";
-import { onTarget, weekEndOf } from "@/lib/goals";
+import { goalPeriod, loadPeriod, periodQuery } from "@/lib/metrics";
+import { onTarget } from "@/lib/goals";
 import { doneIn, dueIn } from "@/lib/tasks";
 import PlanForm from "@/components/PlanForm";
-import WeekPicker from "@/components/WeekPicker";
+import PeriodPicker from "@/components/PeriodPicker";
 
 export const dynamic = "force-dynamic";
 
-export default async function PlansPage({ searchParams }: { searchParams: { week?: string } }) {
+export default async function PlansPage({ searchParams }: { searchParams: { week?: string; period?: string } }) {
   const me = (await getMe())!;
   const sb = supabaseServer();
-  const [{ data: plans }, { data: tasks }, { data: goals }, { data: s }, w] = await Promise.all([
+  const [{ data: plans }, { data: tasks }, { data: goals }, { data: s }, per] = await Promise.all([
     sb.from("plans").select("*").order("start_date", { ascending: false }),
     sb.from("tasks").select("plan_id,status,due_date,completed_at"),
     sb.from("goals").select("*").order("sort"),
     sb.from("settings").select("tracked_keywords").eq("id", 1).single(),
-    loadWeeks(searchParams.week),
+    loadPeriod(searchParams),
   ]);
   const keywords: string[] = s?.tracked_keywords || [];
   const today = new Date().toISOString().slice(0, 10);
-  const mon = w.sel.iso, sun = weekEndOf(mon);
-  const thisWeek = w.sel.label === "This week" || w.sel.label === "Last week" ? w.sel.label.toLowerCase() : `the week of ${w.sel.range}`;
+  // Tasks use calendar dates (the period ends today for "Last 7/28 days"); goals use each source's data dates
+  const { start: from, end: to } = per.tasks;
+  const periodName = per.kind === "week" ? per.label.replace(/^Week of/, "the week of") : per.label.toLowerCase();
 
   return (
     <div className="mx-auto flex max-w-6xl flex-col gap-6">
@@ -30,10 +31,10 @@ export default async function PlansPage({ searchParams }: { searchParams: { week
         <div>
           <p className="text-sm font-semibold uppercase tracking-wider text-brand-dark">Plans & goals</p>
           <h1 className="text-3xl font-extrabold">Our plans</h1>
-          <p className="muted mt-1 text-sm">Each plan has weekly goals, linked to live numbers, and its own tasks. Figures below are for {thisWeek}.</p>
+          <p className="muted mt-1 text-sm">Each plan has weekly goals, linked to live numbers, and its own tasks. Figures below are for {periodName}.</p>
         </div>
         <div className="flex flex-wrap items-end gap-3">
-          <WeekPicker weeks={w.options} value={w.sel.iso} />
+          <PeriodPicker options={per.options} value={per.value} />
           {me.role === "admin" && <PlanForm />}
         </div>
       </header>
@@ -44,13 +45,13 @@ export default async function PlansPage({ searchParams }: { searchParams: { week
           const late = ts.filter((t: any) => t.status !== "done" && t.due_date && t.due_date < today).length;
           const pct = ts.length ? done / ts.length : 0;
           const gs = (goals || []).filter((g: any) => g.plan_id === p.id);
-          const results = gs.map((g: any) => { const r = goalWeekly(g, w, keywords, p); return onTarget(g, r.agg, r.value, r.ctx); });
+          const results = gs.map((g: any) => { const r = goalPeriod(g, per, keywords, p); return onTarget(g, r.agg, r.value, r.ctx); });
           const judged = results.filter((r) => r !== null).length;
           const hit = results.filter((r) => r === true).length;
-          const dueWk = ts.filter((t: any) => dueIn(t, mon, sun));
-          const doneWk = ts.filter((t: any) => doneIn(t, mon, sun)).length;
+          const dueWk = ts.filter((t: any) => dueIn(t, from, to));
+          const doneWk = ts.filter((t: any) => doneIn(t, from, to)).length;
           return (
-            <Link key={p.id} href={`/plans/${p.id}?week=${mon}`} className="card flex flex-col gap-3 transition hover:border-brand/50">
+            <Link key={p.id} href={`/plans/${p.id}?${periodQuery(per)}`} className="card flex flex-col gap-3 transition hover:border-brand/50">
               <div className="flex items-start justify-between gap-3">
                 <h2 className="text-lg font-bold">{p.name}</h2>
                 <span className="chip bg-paper capitalize text-ink-muted">{p.status}</span>

@@ -1,53 +1,55 @@
 import { notFound } from "next/navigation";
 import clsx from "clsx";
-import { addDays, format, parseISO } from "date-fns";
+import { addDays, format, parseISO, subDays } from "date-fns";
 import { getMe, supabaseServer } from "@/lib/supabase-server";
-import { goalWeekly, loadWeeks, METRICS, SPARK_WEEKS, weekLabel } from "@/lib/metrics";
-import { goalStatus, weekEndOf } from "@/lib/goals";
+import { goalPeriod, loadPeriod, METRICS, SPARK_WEEKS } from "@/lib/metrics";
+import { goalStatus, periodTarget } from "@/lib/goals";
 import { doneIn, dueIn, overdueAt } from "@/lib/tasks";
 import GoalBar from "@/components/GoalBar";
 import GoalForm from "@/components/GoalForm";
 import PlanForm from "@/components/PlanForm";
 import TaskBoard from "@/components/TaskBoard";
-import WeekPicker from "@/components/WeekPicker";
+import PeriodPicker from "@/components/PeriodPicker";
 import { fmtNum } from "@/components/Kpi";
 import { Lines } from "@/components/charts";
 
 export const dynamic = "force-dynamic";
 
-export default async function PlanPage({ params, searchParams }: { params: { id: string }; searchParams: { week?: string } }) {
+export default async function PlanPage({ params, searchParams }: { params: { id: string }; searchParams: { week?: string; period?: string } }) {
   const me = (await getMe())!;
   const sb = supabaseServer();
   const { data: plan } = await sb.from("plans").select("*").eq("id", params.id).maybeSingle();
   if (!plan) notFound();
-  const [{ data: goals }, { data: tasks }, { data: people }, { data: plans }, { data: s }, w] = await Promise.all([
+  const [{ data: goals }, { data: tasks }, { data: people }, { data: plans }, { data: s }, per] = await Promise.all([
     sb.from("goals").select("*").eq("plan_id", plan.id).order("sort"),
     sb.from("tasks").select("*").eq("plan_id", plan.id).order("due_date"),
     sb.from("profiles").select("id,email,full_name").order("full_name"),
     sb.from("plans").select("id,name").neq("status", "archived"),
     sb.from("settings").select("tracked_keywords").eq("id", 1).single(),
-    loadWeeks(searchParams.week),
+    loadPeriod(searchParams),
   ]);
   const keywords: string[] = s?.tracked_keywords || [];
   const isAdmin = me.role === "admin";
   const metricOptions = Object.entries(METRICS).map(([k, m]) => ({ key: k, label: m.label, agg: m.agg }));
   const ts = (tasks || []) as any[];
 
-  const mon = w.sel.iso, sun = weekEndOf(mon);
+  // Tasks use calendar dates: "Last 7/28 days" end today, a week runs Mon–Sun
+  const { start: from, end: to } = per.tasks;
   const today = format(new Date(), "yyyy-MM-dd");
-  // Overdue as of the end of the selected week (or today, for the week in progress)
-  const asOf = sun < today ? format(addDays(parseISO(sun), 1), "yyyy-MM-dd") : today;
-  const results = (goals || []).map((g: any) => ({ g, r: goalWeekly(g, w, keywords, plan) }));
-  const dueWk = ts.filter((t) => dueIn(t, mon, sun));
-  const doneWk = ts.filter((t) => doneIn(t, mon, sun));
+  // Overdue as of the end of the selected period (or today, if it hasn't ended)
+  const asOf = to < today ? format(addDays(parseISO(to), 1), "yyyy-MM-dd") : today;
+  const results = (goals || []).map((g: any) => ({ g, r: goalPeriod(g, per, keywords, plan) }));
+  const dueWk = ts.filter((t) => dueIn(t, from, to));
+  const doneWk = ts.filter((t) => doneIn(t, from, to));
   const overdue = ts.filter((t) => overdueAt(t, asOf));
 
-  const taskWeeks = w.isos.slice(1).map((m) => ({
-    week: weekLabel(m),
-    planned: ts.filter((t) => dueIn(t, m, weekEndOf(m))).length,
-    done: ts.filter((t) => doneIn(t, m, weekEndOf(m))).length,
-  }));
-  const weekName = w.sel.label === w.sel.range ? `Week of ${w.sel.range}` : `${w.sel.label} (${w.sel.range})`;
+  // 12 seven-day blocks ending with the period's last day
+  const taskWeeks = per.tasks.blockEnds.slice(1).map((end) => {
+    const s = format(subDays(end, 6), "yyyy-MM-dd"), e = format(end, "yyyy-MM-dd");
+    return { week: format(subDays(end, 6), "MMM d"), planned: ts.filter((t) => dueIn(t, s, e)).length, done: ts.filter((t) => doneIn(t, s, e)).length };
+  });
+  const span = `${format(parseISO(from), "MMM d")} – ${format(parseISO(to), "MMM d")}`;
+  const inPeriod = per.kind === "week" ? "this week" : per.kind === "28d" ? "in the last 28 days" : "in the last 7 days";
 
   const TaskList = ({ items, empty }: { items: any[]; empty: string }) =>
     items.length ? (
@@ -72,15 +74,18 @@ export default async function PlanPage({ params, searchParams }: { params: { id:
           <p className="mt-1 text-xs text-ink-muted">{format(parseISO(plan.start_date), "MMM d, yyyy")} – {format(parseISO(plan.end_date), "MMM d, yyyy")}</p>
         </div>
         <div className="flex flex-wrap items-end gap-3">
-          <WeekPicker weeks={w.options} value={w.sel.iso} />
+          <PeriodPicker options={per.options} value={per.value} />
           {isAdmin && <PlanForm plan={plan} />}
         </div>
       </header>
 
       <section className="card flex flex-col gap-4">
         <div>
-          <h2 className="card-title">This week</h2>
-          <p className="muted text-xs">{weekName}{w.days > 0 && w.days < 7 ? `, ${w.days} day${w.days === 1 ? "" : "s"} so far` : ""}.</p>
+          <h2 className="card-title">{per.kind === "week" ? "This week" : per.label}</h2>
+          <p className="muted text-xs tnum">
+            {per.kind === "week" ? per.label : `Tasks: ${span}`}{per.kind === "week" && per.days > 0 && per.days < 7 ? `, ${per.days} day${per.days === 1 ? "" : "s"} so far` : ""}.
+            {per.kind !== "week" && " Goals use each source’s latest complete data."}
+          </p>
         </div>
         <div className="grid gap-6 lg:grid-cols-4">
           <div className="lg:col-span-1">
@@ -97,7 +102,7 @@ export default async function PlanPage({ params, searchParams }: { params: { id:
                         st.tone === "warn" && "bg-amber-50 text-amber-700",
                         st.tone === "bad" && "bg-red-50 text-red-700",
                         st.tone === "muted" && "bg-paper text-ink-muted")} title={st.label}>
-                        {fmtNum(r.value, r.agg === "avg" ? 1 : 0)} / {fmtNum(g.target, r.agg === "avg" ? 1 : 0)}
+                        {fmtNum(r.value, r.agg === "avg" ? 1 : 0)} / {fmtNum(periodTarget(g, r.agg, r.ctx), r.agg === "avg" ? 1 : 0)}
                       </span>
                     </li>
                   );
@@ -106,11 +111,11 @@ export default async function PlanPage({ params, searchParams }: { params: { id:
             ) : <p className="text-sm text-ink-muted">No goals yet.</p>}
           </div>
           <div>
-            <p className="label">Due this week ({dueWk.length})</p>
-            <TaskList items={dueWk} empty="Nothing due this week." />
+            <p className="label">Due {inPeriod} ({dueWk.length})</p>
+            <TaskList items={dueWk} empty={`Nothing due ${inPeriod}.`} />
           </div>
           <div>
-            <p className="label">Completed this week ({doneWk.length})</p>
+            <p className="label">Completed {inPeriod} ({doneWk.length})</p>
             <TaskList items={doneWk} empty="Nothing completed yet." />
           </div>
           <div>
@@ -132,7 +137,7 @@ export default async function PlanPage({ params, searchParams }: { params: { id:
           <div>
             <h2 className="card-title">Goals</h2>
             <p className="muted text-xs">
-              Weekly targets, judged on the selected week. Sums and counts must reach the target every week;
+              Weekly targets, judged on the selected period (sums count ×4 over 28 days). Sums and counts must reach the target every week;
               rankings and running totals should be on course for it by the end of the plan. The first two weeks of a plan are “too early to tell”.
             </p>
           </div>
@@ -141,7 +146,7 @@ export default async function PlanPage({ params, searchParams }: { params: { id:
         <div className="grid gap-x-8 gap-y-6 md:grid-cols-2 xl:grid-cols-3">
           {results.map(({ g, r }) => (
             <div key={g.id} className="flex flex-col gap-2">
-              <GoalBar goal={g} agg={r.agg} value={r.value} ctx={r.ctx} spark={r.spark} hits={r.hits} counted={r.counted} />
+              <GoalBar goal={g} agg={r.agg} value={r.value} ctx={r.ctx} spark={r.spark} hits={r.hits} counted={r.counted} period={per.kind === "week" ? "this week" : `the ${per.label.toLowerCase()}`} />
               <p className="text-xs text-ink-muted">{g.metric_key ? `Live: ${METRICS[g.metric_key]?.label ?? g.metric_key}` : "Updated by hand"}</p>
               {isAdmin && <GoalForm planId={plan.id} metrics={metricOptions} goal={g} />}
             </div>
@@ -152,7 +157,7 @@ export default async function PlanPage({ params, searchParams }: { params: { id:
 
       <section className="flex flex-col gap-3">
         <h2 className="text-xl font-bold">Tasks in this plan</h2>
-        <TaskBoard tasks={ts as any} people={(people || []) as any} plans={(plans || []) as any} meId={me.id} isAdmin={isAdmin} planId={plan.id} initialView="week" week={mon} />
+        <TaskBoard tasks={ts as any} people={(people || []) as any} plans={(plans || []) as any} meId={me.id} isAdmin={isAdmin} planId={plan.id} initialView="week" week={per.boardWeek} />
       </section>
     </div>
   );

@@ -92,34 +92,70 @@ export function weekOptions() {
   });
 }
 
-export type Win = { start: Date; end: Date; gStart: Date; gEnd: Date };
+/** Each data source gets its own date range: Search Console and Business Profile report days late. */
+export type Src = "ga4" | "gsc" | "gbp";
+export const SOURCES: Src[] = ["ga4", "gsc", "gbp"];
+export type Range = { start: Date; end: Date };
+export type Win = Record<Src, Range>;
+
+const rangeDays = (r: Range) => Math.max(0, Math.round((r.end.getTime() - r.start.getTime()) / 86400000) + 1);
 
 /** Days of the week starting `mon` that have data (`days` caps it, e.g. to match a partial week). */
 export function weekWindow(mon: Date, days = 7): Win {
   const yesterday = subDays(new Date(), 1);
   const gLatest = subDays(new Date(), GSC_SHIFT);
+  const site = { start: mon, end: minDate(addDays(mon, days - 1), yesterday) };
   return {
-    start: mon,
-    end: minDate(addDays(mon, days - 1), yesterday),
-    gStart: subDays(mon, GSC_SHIFT),
-    gEnd: minDate(subDays(addDays(mon, days - 1), GSC_SHIFT), gLatest),
+    ga4: site,
+    gbp: site,
+    gsc: { start: subDays(mon, GSC_SHIFT), end: minDate(subDays(addDays(mon, days - 1), GSC_SHIFT), gLatest) },
   };
 }
 
-/** Number of days with data so far in a week (7 for complete weeks, 0 for a week that hasn't started). */
-export const daysIn = (w: Win) => Math.max(0, Math.round((w.end.getTime() - w.start.getTime()) / 86400000) + 1);
-
-/** GA4, Business Profile and manual rows for the window, plus Search Console rows for its shifted window. */
-export async function rowsFor(w: Win): Promise<MRow[]> {
-  const [a, g] = await Promise.all([
-    w.end >= w.start ? sumBetween(w.start, w.end) : Promise.resolve([]),
-    w.gEnd >= w.gStart ? sumBetween(w.gStart, w.gEnd) : Promise.resolve([]),
-  ]);
-  return [...a.filter((r) => r.source !== "gsc"), ...g.filter((r) => r.source === "gsc")];
+/** `len` days ending `offset` days before each source's latest date with data. */
+export function rollingWindow(latest: Record<Src, Date>, len: number, offset = 0): Win {
+  const r = (d: Date): Range => { const end = subDays(d, offset); return { start: subDays(end, len - 1), end }; };
+  return { ga4: r(latest.ga4), gsc: r(latest.gsc), gbp: r(latest.gbp) };
 }
 
-/** 28 days ending on the window's last day (Search Console shifted the same way). */
-export const window28 = (w: Win): Win => ({ start: subDays(w.end, 27), end: w.end, gStart: subDays(w.gEnd, 27), gEnd: w.gEnd });
+/** Number of days with data so far in a window (7 for complete weeks, 0 for a week that hasn't started). */
+export const daysIn = (w: Win) => rangeDays(w.ga4);
+
+/** Each source's rows for its own range (manual numbers follow the website range). */
+export async function rowsFor(w: Win): Promise<MRow[]> {
+  const key = (r: Range) => `${ymd(r.start)}|${ymd(r.end)}`;
+  const ranges = new Map(SOURCES.map((s) => [key(w[s]), w[s]] as const));
+  const got = new Map(await Promise.all([...ranges].map(async ([k, r]) =>
+    [k, r.end >= r.start ? await sumBetween(r.start, r.end) : []] as const)));
+  return [
+    ...SOURCES.flatMap((s) => (got.get(key(w[s])) || []).filter((r) => r.source === s)),
+    ...(got.get(key(w.ga4)) || []).filter((r) => !SOURCES.includes(r.source as Src)),
+  ];
+}
+
+/** 28 days ending on each source's last day in the window. */
+export const window28 = (w: Win): Win =>
+  Object.fromEntries(SOURCES.map((s) => [s, { start: subDays(w[s].end, 27), end: w[s].end }])) as Win;
+
+/** The latest day each source has real data (values above zero; review snapshots are dated daily, so they don't count). */
+export async function latestDates(): Promise<Record<Src, Date>> {
+  const sb = supabaseServer();
+  const fallback = subDays(new Date(), 1);
+  const found = await Promise.all(SOURCES.map(async (s) => {
+    const { data } = await sb.from("metrics_daily").select("date").eq("source", s).gt("value", 0)
+      .not("metric", "in", "(reviews_snap,rating_snap)").order("date", { ascending: false }).limit(1).maybeSingle();
+    return [s, data?.date ? new Date(data.date + "T00:00:00") : fallback] as const;
+  }));
+  return Object.fromEntries(found) as Record<Src, Date>;
+}
+
+/** "Nov 9–15", or "Oct 31–Nov 6" across months. */
+export function fmtRange(r: Range) {
+  if (r.end < r.start) return "no days yet";
+  return format(r.start, "MMM") === format(r.end, "MMM")
+    ? `${format(r.start, "MMM d")}–${format(r.end, "d")}`
+    : `${format(r.start, "MMM d")}–${format(r.end, "MMM d")}`;
+}
 
 /** A point-in-time value (e.g. review count), or null if there's no snapshot in these rows. */
 export const snap = (rows: MRow[], metric: string, dim: string) => {
@@ -133,15 +169,15 @@ export const SPARK_WEEKS = 12;
  * The selected week (from ?week=, default last complete week) plus the 12 weeks before it, oldest first.
  * `prev` is the week before, cut to the same days while the selected week is still in progress.
  */
-export async function loadWeeks(weekParam?: string) {
+export async function loadWeeks(weekParam?: string, count = SPARK_WEEKS) {
   const options = weekOptions();
   const sel = options.find((o) => o.iso === weekParam) ?? options[1];
   const selMon = new Date(sel.iso + "T00:00:00");
-  const mondays = Array.from({ length: SPARK_WEEKS + 1 }, (_, i) => subWeeks(selMon, SPARK_WEEKS - i));
+  const mondays = Array.from({ length: count + 1 }, (_, i) => subWeeks(selMon, count - i));
   const wins = mondays.map((m) => weekWindow(m));
-  const curWin = wins[SPARK_WEEKS];
+  const curWin = wins[count];
   const days = daysIn(curWin);
-  const prevWin = days < 7 ? weekWindow(mondays[SPARK_WEEKS - 1], days) : wins[SPARK_WEEKS - 1];
+  const prevWin = days < 7 ? weekWindow(mondays[count - 1], days) : wins[count - 1];
   const [rows, partialPrev] = await Promise.all([
     Promise.all(wins.map(rowsFor)),
     days < 7 ? rowsFor(prevWin) : Promise.resolve(null),
@@ -149,33 +185,109 @@ export async function loadWeeks(weekParam?: string) {
   return {
     options, sel, mondays, wins, rows, days, curWin, prevWin,
     isos: mondays.map(ymd),
-    cur: rows[SPARK_WEEKS],
-    prev: partialPrev ?? rows[SPARK_WEEKS - 1],
+    cur: rows[count],
+    prev: partialPrev ?? rows[count - 1],
   };
 }
 export type Weeks = Awaited<ReturnType<typeof loadWeeks>>;
 
+// ---------- Periods: last 7 days, last 28 days, or one Mon–Sun week ----------
+export type PeriodKind = "7d" | "28d" | "week";
+
+/** Choices for the period selector: the two rolling periods, then the weeks. */
+export function periodOptions() {
+  return [
+    { value: "7d", label: "Last 7 days" },
+    { value: "28d", label: "Last 28 days" },
+    ...weekOptions().map((o) => ({ value: o.iso, label: o.label === o.range ? o.range : `${o.label} (${o.range})` })),
+  ];
+}
+
+/** Query string that keeps the selected period on links between pages. */
+export const periodQuery = (p: { kind: PeriodKind; value: string }) => (p.kind === "week" ? `week=${p.value}` : `period=${p.value}`);
+
+/**
+ * The selected period (default: last 7 days) with its comparison period, plus 13 seven-day blocks
+ * (oldest first, the last one ending with the period) for sparklines, weekly charts and goal history.
+ * Rolling periods end on each source's latest day with data, so late data never reads as a drop.
+ */
+export async function loadPeriod(params: { period?: string; week?: string }) {
+  const options = periodOptions();
+  const weekIso = weekOptions().find((o) => o.iso === params.week)?.iso;
+  const kind: PeriodKind = params.period === "28d" ? "28d" : !params.period && weekIso ? "week" : "7d";
+  const today = new Date();
+
+  if (kind === "week") {
+    const w = await loadWeeks(weekIso);
+    return {
+      kind, value: w.sel.iso, options, len: 7, days: w.days,
+      label: w.sel.label === w.sel.range ? `Week of ${w.sel.range}` : `${w.sel.label} (${w.sel.range})`,
+      curWin: w.curWin, prevWin: w.prevWin, cur: w.cur, prev: w.prev,
+      blocks: { wins: w.wins, rows: w.rows },
+      weeks: w,
+      boardWeek: w.sel.iso,
+      tasks: { start: w.sel.iso, end: ymd(addDays(w.mondays[SPARK_WEEKS], 6)), blockEnds: w.mondays.map((m) => addDays(m, 6)) },
+    };
+  }
+
+  const len = kind === "28d" ? 28 : 7;
+  const latest = await latestDates();
+  const blockWins = Array.from({ length: SPARK_WEEKS + 1 }, (_, i) => rollingWindow(latest, 7, 7 * (SPARK_WEEKS - i)));
+  const curWin = len === 7 ? blockWins[SPARK_WEEKS] : rollingWindow(latest, len);
+  const prevWin = len === 7 ? blockWins[SPARK_WEEKS - 1] : rollingWindow(latest, len, len);
+  const [blockRows, cur28, prev28] = await Promise.all([
+    Promise.all(blockWins.map(rowsFor)),
+    len === 28 ? rowsFor(curWin) : Promise.resolve(null),
+    len === 28 ? rowsFor(prevWin) : Promise.resolve(null),
+  ]);
+  return {
+    kind, value: kind as string, options, len, days: len,
+    label: kind === "28d" ? "Last 28 days" : "Last 7 days",
+    curWin, prevWin,
+    cur: cur28 ?? blockRows[SPARK_WEEKS],
+    prev: prev28 ?? blockRows[SPARK_WEEKS - 1],
+    blocks: { wins: blockWins, rows: blockRows },
+    weeks: null,
+    boardWeek: ymd(mondayOf(today)),
+    // Tasks aren't reported late: their period ends today
+    tasks: {
+      start: ymd(subDays(today, len - 1)), end: ymd(today),
+      blockEnds: Array.from({ length: SPARK_WEEKS + 1 }, (_, i) => subDays(today, 7 * (SPARK_WEEKS - i))),
+    },
+  };
+}
+export type Period = Awaited<ReturnType<typeof loadPeriod>>;
+
+/** "Website: Nov 9–15 vs Nov 2–8 · Search Console: … · Google Maps: …" */
+export const SOURCE_NAMES: Record<Src, string> = { ga4: "Website", gsc: "Search Console", gbp: "Google Maps" };
+export const periodDates = (p: Period, s: Src) => `${fmtRange(p.curWin[s])} vs ${fmtRange(p.prevWin[s])}`;
+
 /** A goal's agg type: hand-entered goals have none and are treated as a level heading for the target. */
 export const aggOf = (g: Goal): Agg | null => (g.metric_key ? METRICS[g.metric_key]?.agg ?? null : null);
 
-/** Everything a goal shows for the selected week: value, 12-week spark and how often it hit target. */
-export function goalWeekly(g: Goal, w: Weeks, keywords: string[], plan?: { start_date: string; end_date: string }) {
-  const agg = aggOf(g);
-  const ctxAt = (i: number): WeekCtx => ({ weekStart: w.isos[i], days: daysIn(w.wins[i]), planStart: plan?.start_date, planEnd: plan?.end_date });
-  const valueAt = (i: number) =>
-    !g.metric_key ? g.manual_value : w.rows[i].length ? METRICS[g.metric_key]?.fn(w.rows[i], { keywords }) ?? null : null;
+/** The source a goal's metric comes from, so its dates follow that source's window. */
+const srcOf = (g: Goal): Src =>
+  g.metric_key && /question|brand|nonbrand|gsc_|top5/.test(g.metric_key) ? "gsc" : g.metric_key?.startsWith("gbp_") ? "gbp" : "ga4";
+
+/** Everything a goal shows for the selected period: value, 12-week spark and how often it hit target. */
+export function goalPeriod(g: Goal, p: Period, keywords: string[], plan?: { start_date: string; end_date: string }) {
+  const agg = aggOf(g), src = srcOf(g);
+  const ctxFor = (w: Win, len: number): WeekCtx =>
+    ({ weekStart: ymd(w[src].start), days: Math.min(len, daysIn(w)), len, planStart: plan?.start_date, planEnd: plan?.end_date });
+  const valueOf = (rows: MRow[]) =>
+    !g.metric_key ? g.manual_value : rows.length ? METRICS[g.metric_key]?.fn(rows, { keywords }) ?? null : null;
   const idx = Array.from({ length: SPARK_WEEKS }, (_, i) => i + 1);
-  // Count complete weeks with data since the plan started
-  const planMon = plan ? ymd(mondayOf(new Date(plan.start_date + "T00:00:00"))) : "";
+  const { wins, rows } = p.blocks;
+  // Count complete 7-day blocks with data since the plan started
   const counted = g.metric_key
-    ? idx.filter((i) => daysIn(w.wins[i]) === 7 && w.rows[i].length > 0 && w.isos[i] >= planMon && valueAt(i) !== null)
+    ? idx.filter((i) => daysIn(wins[i]) === 7 && rows[i].length > 0 && (!plan || ymd(wins[i][src].end) >= plan.start_date) && valueOf(rows[i]) !== null)
     : [];
   return {
     agg,
-    ctx: ctxAt(SPARK_WEEKS),
-    value: valueAt(SPARK_WEEKS),
-    spark: g.metric_key ? idx.map(valueAt) : [],
-    hits: counted.filter((i) => onTarget(g, agg, valueAt(i), ctxAt(i))).length,
+    ctx: { ...ctxFor(p.curWin, p.len), days: p.days },
+    value: valueOf(p.cur),
+    spark: g.metric_key ? idx.map((i) => valueOf(rows[i])) : [],
+    hits: counted.filter((i) => onTarget(g, agg, valueOf(rows[i]), ctxFor(wins[i], 7))).length,
     counted: counted.length,
   };
 }
@@ -183,13 +295,13 @@ export function goalWeekly(g: Goal, w: Weeks, keywords: string[], plan?: { start
 // ---------- Review count history (daily reviews_snap per location) ----------
 export type Snap = { date: string; dim: string; value: number };
 
-/** Every review-count snapshot, oldest first (a few rows per day, so this stays small). */
-export async function reviewSnaps(): Promise<Snap[]> {
+/** Every review-count (or rating) snapshot, oldest first (a few rows per day, so this stays small). */
+export async function reviewSnaps(metric: "reviews_snap" | "rating_snap" = "reviews_snap"): Promise<Snap[]> {
   const sb = supabaseServer();
   const out: Snap[] = [];
   for (let from = 0; ; from += 1000) {
     const { data, error } = await sb.from("metrics_daily").select("date,dim,value")
-      .eq("source", "gbp").eq("metric", "reviews_snap").order("date").range(from, from + 999);
+      .eq("source", "gbp").eq("metric", metric).order("date").range(from, from + 999);
     if (error) throw new Error(error.message);
     out.push(...(data || []).map((r: any) => ({ date: r.date as string, dim: r.dim as string, value: Number(r.value) })));
     if (!data || data.length < 1000) break;
@@ -218,6 +330,67 @@ export function reviews28(snaps: Snap[], loc: string, asOf: string, strict = fal
 export function reviews28All(snaps: Snap[], locs: string[], asOf: string) {
   const diffs = locs.map((l) => reviews28(snaps, l, asOf, true)?.diff).filter((n): n is number => n !== null && n !== undefined);
   return diffs.length ? diffs.reduce((s, n) => s + n, 0) : null;
+}
+
+/** Latest snapshot value on or before `asOf` (yyyy-MM-dd), or null. */
+export function snapAt(snaps: Snap[], loc: string, asOf: string) {
+  let v: number | null = null;
+  for (const s of snaps) if (s.dim === loc && s.date <= asOf) v = s.value;
+  return v;
+}
+
+export type ReviewFlow = {
+  now: number; nowDate: string; start: number; startDate: string;
+  /** No snapshot before the period, so it starts from the oldest one inside it ("Since <date>"). */
+  fallback: boolean;
+  gained: number; removed: number; net: number; kept: number | null;
+  daily: Map<string, { gained: number; removed: number }>;
+};
+
+/**
+ * Reviews gained and removed at one location between `start` and `end` (yyyy-MM-dd, inclusive).
+ *
+ * Today this walks the daily review totals: each day's change from the previous existing day is a
+ * gain or a removal, so both are minimums (a gain and a removal on the same day cancel out). When
+ * the Google reviews API is approved, this is the one place to switch to comparing review IDs.
+ */
+export function reviewFlow(snaps: Snap[], loc: string, start: string, end: string): ReviewFlow | null {
+  const mine = snaps.filter((s) => s.dim === loc && s.date <= end);
+  const nowSnap = mine[mine.length - 1];
+  if (!nowSnap || nowSnap.date < start) return null; // no snapshot in the period (e.g. a renamed profile)
+  const before = mine.filter((s) => s.date < start);
+  const fallback = before.length === 0;
+  const startSnap = fallback ? mine.find((s) => s.date >= start)! : before[before.length - 1];
+
+  const daily = new Map<string, { gained: number; removed: number }>();
+  let gained = 0, removed = 0, prev = startSnap.value;
+  for (const s of mine) {
+    if (s.date <= startSnap.date) continue;
+    const d = s.value - prev;
+    prev = s.value;
+    if (d === 0) continue;
+    const day = daily.get(s.date) || { gained: 0, removed: 0 };
+    if (d > 0) { gained += d; day.gained += d; } else { removed -= d; day.removed -= d; }
+    daily.set(s.date, day);
+  }
+  const net = gained - removed;
+  if (net !== nowSnap.value - startSnap.value) {
+    // Can't happen: the daily changes add up to now − start. Logged rather than thrown so the page still loads.
+    console.error(`reviewFlow: net ${net} ≠ now − start ${nowSnap.value - startSnap.value} for ${loc} ${start}..${end}`);
+  }
+  return {
+    now: nowSnap.value, nowDate: nowSnap.date, start: startSnap.value, startDate: startSnap.date, fallback,
+    gained, removed, net, kept: gained ? net / gained : null, daily,
+  };
+}
+
+/** Gained and removed added up over every location with snapshots in the period. */
+export function reviewFlowAll(snaps: Snap[], start: string, end: string) {
+  const locs = [...new Set(snaps.filter((s) => s.date >= start && s.date <= end).map((s) => s.dim))];
+  const flows = locs.map((l) => reviewFlow(snaps, l, start, end)).filter((f): f is ReviewFlow => f !== null);
+  return flows.length
+    ? { gained: flows.reduce((s, f) => s + f.gained, 0), removed: flows.reduce((s, f) => s + f.removed, 0) }
+    : null;
 }
 
 /** Reviews gained between two weeks' latest snapshots, per location; null when either week has none. */

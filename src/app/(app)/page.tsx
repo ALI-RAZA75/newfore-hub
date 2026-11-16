@@ -1,9 +1,9 @@
 import Link from "next/link";
-import { addDays, format, formatDistanceToNow } from "date-fns";
+import { addDays, eachDayOfInterval, format, formatDistanceToNow, subDays } from "date-fns";
 import { getMe, supabaseServer } from "@/lib/supabase-server";
 import {
-  byDim, goalWeekly, loadWeeks, METRICS, MRow, newReviews, newReviewsAll, pick, reviews28, reviews28All, reviewSnaps, rowsFor, snap, SPARK_WEEKS,
-  weekLabel, window28,
+  byDim, fmtRange, goalPeriod, loadPeriod, loadWeeks, METRICS, MRow, newReviewsAll, periodDates, periodQuery, pick, ReviewFlow, reviewFlow,
+  reviewFlowAll, reviews28All, reviewSnaps, rowsFor, snapAt, SOURCE_NAMES, SOURCES, window28,
 } from "@/lib/metrics";
 import { CHANNELS } from "@/lib/classify";
 import { GOAL_SOURCE, MANUAL_SOURCE, SCORECARD } from "@/lib/scorecard";
@@ -13,12 +13,14 @@ import LiveNow from "@/components/LiveNow";
 import SyncButton from "@/components/SyncButton";
 import { Flow, Lines, StackedWeeks } from "@/components/charts";
 import GoalBar from "@/components/GoalBar";
-import WeekPicker from "@/components/WeekPicker";
+import PeriodPicker from "@/components/PeriodPicker";
 import Scorecard, { ScoreRow } from "@/components/Scorecard";
+import ReviewFlowChart from "@/components/ReviewFlowChart";
 
 export const dynamic = "force-dynamic";
 
 const SCORE_WEEKS = 8;
+const FLOW_NOTE = "Counted from daily totals, so gained/removed are minimums. Exact counts come once the Google reviews API is approved.";
 
 /** Sum of the numbers present; null when there are none. */
 const sumOf = (xs: (number | null | undefined)[]) => {
@@ -26,48 +28,49 @@ const sumOf = (xs: (number | null | undefined)[]) => {
   return ns.length ? ns.reduce((s, n) => s + n, 0) : null;
 };
 
-/** +/- badge for reviews gained: green up, red down. */
-function NewBadge({ n }: { n: number | null }) {
-  if (n === null) return <span className="text-ink-muted">—</span>;
-  return (
-    <span className={n > 0 ? "chip bg-emerald-50 text-emerald-700" : n < 0 ? "chip bg-red-50 text-red-700" : "chip bg-paper text-ink-muted"}>
-      {n > 0 ? "+" : ""}{fmtNum(n)}
-    </span>
-  );
-}
+const ymd = (d: Date) => format(d, "yyyy-MM-dd");
+const day = (s: string) => new Date(s + "T00:00:00");
+const pct = (n: number | null) => (n === null ? "—" : `${Math.round(n * 100)}%`);
 
-export default async function Performance({ searchParams }: { searchParams: { week?: string } }) {
+export default async function Performance({ searchParams }: { searchParams: { week?: string; period?: string } }) {
   const me = await getMe();
   const sb = supabaseServer();
   const { data: s } = await sb.from("settings").select("*").eq("id", 1).single();
   const keywords: string[] = s?.tracked_keywords || [];
 
-  // Selected week (default: last complete week) and the 12 weeks before it, oldest first.
-  // A week still in progress is compared with the same days of the week before.
-  const w = await loadWeeks(searchParams.week);
-  const { options, sel, mondays, days, curWin, prevWin, cur, prev } = w;
-  const weekRows = w.rows;
-  const [d28, goalRows, snaps] = await Promise.all([
+  // Selected period (default: last 7 days, ending on each source's latest data) and its comparison
+  const p = await loadPeriod(searchParams);
+  const { cur, prev, curWin, prevWin, kind, len, days } = p;
+  const [d28, goalRows, snaps, ratings, sc] = await Promise.all([
     rowsFor(window28(curWin)),
     sb.from("metrics_daily").select("metric,value").eq("source", GOAL_SOURCE).then((r) => r.data || []),
     reviewSnaps(),
+    reviewSnaps("rating_snap"),
+    // The EOS scorecard always shows Mon–Sun weeks (the last 8 complete ones for rolling periods)
+    p.weeks ? Promise.resolve(p.weeks) : loadWeeks(undefined, SCORE_WEEKS),
   ]);
-  const lastWeekFull = weekRows[SPARK_WEEKS - 1];
-  const sparkRows = weekRows.slice(1);
-  const sparkWeeks = w.isos.slice(1).map(weekLabel);
+  const blockRows = p.blocks.rows.slice(1);
+  const blockWins = p.blocks.wins.slice(1);
 
   const { data: plan } = await sb.from("plans").select("id,name,start_date,end_date").eq("status", "active").order("start_date").limit(1).maybeSingle();
   const { data: goals } = plan
     ? await sb.from("goals").select("*").eq("plan_id", plan.id).order("sort").limit(4)
     : { data: [] as any[] };
 
-  const hasData = weekRows.some((r) => r.length > 0) || d28.length > 0;
+  const words = kind === "28d"
+    ? { cur: "Last 28 days", prev: "Previous 28 days", in: "the last 28 days" }
+    : kind === "7d"
+      ? { cur: "Last 7 days", prev: "7 days before", in: "the last 7 days" }
+      : { cur: "This week", prev: "Week before", in: "this week" };
+  const dates = (src: "ga4" | "gsc" | "gbp") => periodDates(p, src);
+
+  const hasData = p.blocks.rows.some((r) => r.length > 0) || d28.length > 0;
   const v = (rows: MRow[], key: string) => METRICS[key].fn(rows, { keywords });
-  const series = (key: string) => sparkRows.map((rows) => v(rows, key));
+  const series = (key: string) => blockRows.map((rows) => v(rows, key));
   const profileActions = (rows: MRow[]) => pick(rows, "gbp", "calls") + pick(rows, "gbp", "website_clicks") + pick(rows, "gbp", "directions");
   const has = (rows: MRow[], source: string) => rows.some((r) => r.source === source);
 
-  // Weekly scorecard: last 8 weeks ending with the selected week
+  // Weekly scorecard (EOS): last 8 Mon–Sun weeks
   const snapLocs = (rows: MRow[]) => [...new Set(rows.filter((r) => r.source === "gbp" && r.metric === "reviews_snap").map((r) => r.dim))];
   const scoreFn: Record<string, (rows: MRow[], before: MRow[], mon: string) => number | null> = {
     leads: (r) => (has(r, "ga4") ? pick(r, "ga4", "leads") : null),
@@ -79,26 +82,30 @@ export default async function Performance({ searchParams }: { searchParams: { we
     new_reviews: (r, before) => newReviewsAll(r, before),
     // Strict 28 days to the week's end: blank until 28 days of snapshots exist
     new_reviews_28d: (r, _before, mon) => reviews28All(snaps, snapLocs(r), weekEndOf(mon)),
+    reviews_gained: (_r, _before, mon) => reviewFlowAll(snaps, mon, weekEndOf(mon))?.gained ?? null,
+    reviews_removed: (_r, _before, mon) => reviewFlowAll(snaps, mon, weekEndOf(mon))?.removed ?? null,
   };
   const manual = (rows: MRow[], key: string) => rows.find((r) => r.source === MANUAL_SOURCE && r.metric === key)?.value ?? null;
-  const scoreIdx = Array.from({ length: SCORE_WEEKS }, (_, i) => SPARK_WEEKS - SCORE_WEEKS + 1 + i);
-  const scoreWeeks = scoreIdx.map((i) => ({ iso: format(mondays[i], "yyyy-MM-dd"), range: `${format(mondays[i], "MMM d")} – ${format(addDays(mondays[i], 6), "MMM d")}` }));
+  const scLast = sc.rows.length - 1;
+  const scoreIdx = Array.from({ length: SCORE_WEEKS }, (_, i) => scLast - SCORE_WEEKS + 1 + i);
+  const scoreWeeks = scoreIdx.map((i) => ({ iso: sc.isos[i], range: `${format(sc.mondays[i], "MMM d")} – ${format(addDays(sc.mondays[i], 6), "MMM d")}` }));
   const scoreRows: ScoreRow[] = SCORECARD.map((m) => ({
     ...m,
     goal: goalRows.find((g: any) => g.metric === m.key)?.value ?? null,
-    values: scoreIdx.map((i) => (m.manual ? manual(weekRows[i], m.key) : scoreFn[m.key](weekRows[i], weekRows[i - 1], w.isos[i]))),
+    values: scoreIdx.map((i) => (m.manual ? manual(sc.rows[i], m.key) : scoreFn[m.key](sc.rows[i], sc.rows[i - 1], sc.isos[i]))),
   }));
 
-  // Weekly visits by channel
-  const channelWeeks = sparkRows.map((rows, i) => {
-    const row: Record<string, any> = { week: sparkWeeks[i] };
+  // Weekly visits by channel (7-day blocks ending with the period)
+  const blockLabel = (i: number, src: "ga4" | "gsc") => format(blockWins[i][src].start, "MMM d");
+  const channelWeeks = blockRows.map((rows, i) => {
+    const row: Record<string, any> = { week: blockLabel(i, "ga4") };
     for (const c of CHANNELS) row[c] = pick(rows, "ga4", "sessions", c);
     return row;
   });
   const activeChannels = CHANNELS.filter((c) => channelWeeks.some((r) => r[c] > 0));
   const flow = CHANNELS.map((c) => ({ name: c, sessions: pick(cur, "ga4", "sessions", c), leads: pick(cur, "ga4", "leads", c) }));
 
-  // AI platforms, this week vs the week before
+  // AI platforms, this period vs the one before
   const aiNow = byDim(cur, "ga4", "ai_sessions"), aiPrev = byDim(prev, "ga4", "ai_sessions");
   const aiLeads = byDim(cur, "ga4", "ai_leads"), aiLeadsPrev = byDim(prev, "ga4", "ai_leads");
   const aiList = [...new Set([...aiNow.keys(), ...aiPrev.keys()])]
@@ -106,33 +113,42 @@ export default async function Performance({ searchParams }: { searchParams: { we
     .filter((a) => a.n > 0 || a.p > 0)
     .sort((a, b) => b.n - a.n || b.p - a.p);
   const aiMax = Math.max(1, ...aiList.map((a) => a.n));
-  const aiWeekly = sparkRows.map((rows, i) => ({ week: sparkWeeks[i], ai: pick(rows, "ga4", "ai_sessions") }));
+  const aiWeekly = blockRows.map((rows, i) => ({ week: blockLabel(i, "ga4"), ai: pick(rows, "ga4", "ai_sessions") }));
 
-  // Maps by location
-  const locNames = [...new Set([...cur, ...prev].filter((r) => r.source === "gbp").map((r) => r.dim))].sort();
+  // Reviews: their own window, ending on the latest snapshot (one a day per location)
+  const lastSnap = snaps.length ? snaps[snaps.length - 1].date : ymd(subDays(new Date(), 1));
+  const revRange = kind === "week"
+    ? { start: p.value, end: weekEndOf(p.value) }
+    : { start: ymd(subDays(day(lastSnap), len - 1)), end: lastSnap };
+  const perfLocs = [...cur, ...prev].filter((r) => r.source === "gbp" && !r.metric.endsWith("_snap")).map((r) => r.dim);
+  const snapLocsInRange = snaps.filter((x) => x.date >= revRange.start && x.date <= revRange.end).map((x) => x.dim);
+  const locNames = [...new Set([...perfLocs, ...snapLocsInRange])].sort();
+  const flows = new Map(locNames.map((l) => [l, reviewFlow(snaps, l, revRange.start, revRange.end)] as const));
+  const flowList = [...flows.values()].filter((f): f is ReviewFlow => f !== null);
+  const sinceDates = [...new Set(flowList.filter((f) => f.fallback).map((f) => f.startDate))].sort();
+  const startHeader = sinceDates.length ? `Since ${format(day(sinceDates[0]), "MMM d")}` : "Start of period";
+  const total = {
+    now: sumOf(flowList.map((f) => f.now)), start: sumOf(flowList.map((f) => f.start)),
+    gained: sumOf(flowList.map((f) => f.gained)), removed: sumOf(flowList.map((f) => f.removed)),
+  };
+  const totalNet = total.gained === null || total.removed === null ? null : total.gained - total.removed;
+  const ratingNow = (l: string) => snapAt(ratings, l, revRange.end);
+  const ratingAll = (() => {
+    const both = locNames.map((l) => ({ n: flows.get(l)?.now ?? null, r: ratingNow(l) }))
+      .filter((x): x is { n: number; r: number } => x.n !== null && x.r !== null && x.n > 0 && x.r > 0);
+    const n = both.reduce((sum, x) => sum + x.n, 0);
+    return n ? both.reduce((sum, x) => sum + x.r * x.n, 0) / n : null;
+  })();
+  const chartDays = revRange.end >= revRange.start
+    ? eachDayOfInterval({ start: day(revRange.start), end: day(revRange.end) }).map(ymd) : [];
+  const byLoc = Object.fromEntries(flowList.length
+    ? locNames.filter((l) => flows.get(l)).map((l) => [l, Object.fromEntries(flows.get(l)!.daily)])
+    : []);
+
   const siteVisits = (rows: MRow[], l: string) =>
     [...byDim(rows, "ga4", "gbp_sessions").entries()]
       .filter(([k]) => l.toLowerCase().includes(k.toLowerCase()) || k.toLowerCase().includes(l.toLowerCase().split(" ")[0]))
       .reduce((sum, [, n]) => sum + n, 0);
-  // Reviews gained over 28 days, per location, as of the end of the selected week
-  const reviewsAsOf = weekEndOf(sel.iso);
-  const rev28 = (() => {
-    const byLoc = new Map(locNames.map((l) => [l, reviews28(snaps, l, reviewsAsOf)] as const));
-    const fallbackDates = [...new Set([...byLoc.values()].filter((r) => r?.fallback && r.past !== null).map((r) => r!.pastDate))].sort();
-    return {
-      byLoc,
-      anyFallback: fallbackDates.length > 0,
-      mixedDates: fallbackDates.length > 1,
-      sinceLabel: fallbackDates.length ? format(new Date(fallbackDates[0] + "T00:00:00"), "MMM d") : "",
-    };
-  })();
-  const ratingAll = (() => {
-    const both = locNames
-      .map((l) => ({ n: snap(cur, "reviews_snap", l), r: snap(cur, "rating_snap", l) }))
-      .filter((x): x is { n: number; r: number } => x.n !== null && x.r !== null && x.n > 0 && x.r > 0);
-    const total = both.reduce((s, x) => s + x.n, 0);
-    return total ? both.reduce((s, x) => s + x.r * x.n, 0) / total : null;
-  })();
   const mapsCols: { label: string; fn: (rows: MRow[], l: string) => number }[] = [
     { label: "Profile views", fn: (r, l) => pick(r, "gbp", "views", l) },
     { label: "Calls", fn: (r, l) => pick(r, "gbp", "calls", l) },
@@ -142,8 +158,8 @@ export default async function Performance({ searchParams }: { searchParams: { we
   ];
 
   // Search
-  const searchWeekly = sparkRows.map((rows, i) => ({
-    week: sparkWeeks[i], brand: pick(rows, "gsc", "clicks", "brand"), question: pick(rows, "gsc", "clicks", "question"), short: pick(rows, "gsc", "clicks", "short"),
+  const searchWeekly = blockRows.map((rows, i) => ({
+    week: blockLabel(i, "gsc"), brand: pick(rows, "gsc", "clicks", "brand"), question: pick(rows, "gsc", "clicks", "question"), short: pick(rows, "gsc", "clicks", "short"),
   }));
   const kwPos = (rows: MRow[], k: string) => {
     const imp = pick(rows, "gsc", "kw_impr", k.toLowerCase());
@@ -151,22 +167,21 @@ export default async function Performance({ searchParams }: { searchParams: { we
   };
   const kwViews = (rows: MRow[], k: string) => pick(rows, "gsc", "kw_impr", k.toLowerCase());
 
-  const span = (w: { start: Date; end: Date }) => w.end < w.start ? "no days yet" : `${format(w.start, "MMM d")} – ${format(w.end, "MMM d")}`;
-
   return (
     <div className="mx-auto flex max-w-7xl flex-col gap-6">
       <header className="flex flex-wrap items-end justify-between gap-4">
-        <div>
+        <div className="max-w-3xl">
           <p className="text-sm font-semibold uppercase tracking-wider text-brand-dark">Performance</p>
-          <h1 className="text-3xl font-extrabold">{sel.label === sel.range ? `Week of ${sel.range}` : `${sel.label} at Newfore`}</h1>
-          <p className="muted mt-1 text-sm">
-            {span(curWin)} compared with {span(prevWin)}{days > 0 && days < 7 ? " (same days, since this week isn’t over)" : ""}.
-            {" "}Search Console uses {span({ start: curWin.gStart, end: curWin.gEnd })}, 3 days earlier, because Google reports it late.
+          <h1 className="text-3xl font-extrabold">{p.label} at Newfore</h1>
+          <p className="muted mt-1 text-sm tnum">
+            {SOURCES.map((src) => `${SOURCE_NAMES[src]}: ${dates(src)}`).join(" · ")}
+            {" · "}Reviews: {fmtRange({ start: day(revRange.start), end: day(revRange.end) })}
+            {kind === "week" && days > 0 && days < 7 ? " (compared with the same days of the week before)" : ""}
             {s?.last_sync_at && <> · Synced {formatDistanceToNow(new Date(s.last_sync_at))} ago</>}
           </p>
         </div>
         <div className="flex flex-wrap items-end gap-3">
-          <WeekPicker weeks={options} value={sel.iso} />
+          <PeriodPicker options={p.options} value={p.value} />
           {me?.role === "admin" && <SyncButton />}
         </div>
       </header>
@@ -179,8 +194,8 @@ export default async function Performance({ searchParams }: { searchParams: { we
           </p>
         </div>
       )}
-      {hasData && days === 0 && (
-        <div className="card border-brand/40 bg-brand-soft text-sm">This week has just started, so there’s no data for it yet. Pick “Last week” to see the latest full week.</div>
+      {hasData && kind === "week" && days === 0 && (
+        <div className="card border-brand/40 bg-brand-soft text-sm">This week has just started, so there’s no data for it yet. Pick “Last 7 days” or “Last week”.</div>
       )}
 
       <Scorecard weeks={scoreWeeks} rows={scoreRows} isAdmin={me?.role === "admin"} />
@@ -190,13 +205,13 @@ export default async function Performance({ searchParams }: { searchParams: { we
         <section className="card flex flex-col gap-4 lg:col-span-2">
           <div className="flex items-center justify-between">
             <h2 className="card-title">{plan ? plan.name : "Plan goals"}</h2>
-            <Link href={plan ? `/plans/${plan.id}` : "/plans"} className="text-sm font-semibold text-brand-dark hover:underline">All goals →</Link>
+            <Link href={plan ? `/plans/${plan.id}?${periodQuery(p)}` : "/plans"} className="text-sm font-semibold text-brand-dark hover:underline">All goals →</Link>
           </div>
           {(goals || []).length ? (
             <div className="grid gap-4 sm:grid-cols-2">
               {(goals || []).map((g: any) => {
-                const r = goalWeekly(g, w, keywords, plan ?? undefined);
-                return <GoalBar key={g.id} goal={g} agg={r.agg} value={r.value} ctx={r.ctx} spark={r.spark} hits={r.hits} counted={r.counted} compact />;
+                const r = goalPeriod(g, p, keywords, plan ?? undefined);
+                return <GoalBar key={g.id} goal={g} agg={r.agg} value={r.value} ctx={r.ctx} spark={r.spark} hits={r.hits} counted={r.counted} period={words.in} compact />;
               })}
             </div>
           ) : <p className="muted text-sm">No goals yet. Add them on the Plans page.</p>}
@@ -204,23 +219,26 @@ export default async function Performance({ searchParams }: { searchParams: { we
       </div>
 
       <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-        <Kpi label="Leads (forms, calls, emails)" cur={v(cur, "total_leads_28d")} prev={v(prev, "total_leads_28d")} spark={series("total_leads_28d")} />
-        <Kpi label="Visits from AI assistants" cur={v(cur, "ai_sessions_28d")} prev={v(prev, "ai_sessions_28d")} spark={series("ai_sessions_28d")} />
-        <Kpi label="Google profile actions" cur={profileActions(cur)} prev={profileActions(prev)} spark={sparkRows.map(profileActions)} color="#2E9E6B" note="calls, website, directions" />
-        <Kpi label="Website visits" cur={v(cur, "sessions_28d")} prev={v(prev, "sessions_28d")} spark={series("sessions_28d")} color="#2C3338" />
-        <Kpi label="Google Search clicks" cur={v(cur, "gsc_clicks_28d")} prev={v(prev, "gsc_clicks_28d")} spark={series("gsc_clicks_28d")} color="#3B6FD8" />
-        <Kpi label="Avg ranking, question searches" cur={v(cur, "question_position_28d")} prev={v(prev, "question_position_28d")} spark={series("question_position_28d")} color="#3B6FD8" decimals={1} lowerIsBetter note="lower is better" />
+        <Kpi label="Leads (forms, calls, emails)" cur={v(cur, "total_leads_28d")} prev={v(prev, "total_leads_28d")} spark={series("total_leads_28d")} prevLabel={words.prev} dates={dates("ga4")} />
+        <Kpi label="Visits from AI assistants" cur={v(cur, "ai_sessions_28d")} prev={v(prev, "ai_sessions_28d")} spark={series("ai_sessions_28d")} prevLabel={words.prev} dates={dates("ga4")} />
+        <Kpi label="Google profile actions" cur={profileActions(cur)} prev={profileActions(prev)} spark={blockRows.map(profileActions)} color="#2E9E6B" note="calls, website, directions" prevLabel={words.prev} dates={dates("gbp")} />
+        <Kpi label="Website visits" cur={v(cur, "sessions_28d")} prev={v(prev, "sessions_28d")} spark={series("sessions_28d")} color="#2C3338" prevLabel={words.prev} dates={dates("ga4")} />
+        <Kpi label="Google Search clicks" cur={v(cur, "gsc_clicks_28d")} prev={v(prev, "gsc_clicks_28d")} spark={series("gsc_clicks_28d")} color="#3B6FD8" prevLabel={words.prev} dates={dates("gsc")} />
+        <Kpi label="Avg ranking, question searches" cur={v(cur, "question_position_28d")} prev={v(prev, "question_position_28d")} spark={series("question_position_28d")} color="#3B6FD8" decimals={1} lowerIsBetter note="lower is better" prevLabel={words.prev} dates={dates("gsc")} />
       </section>
 
       <div className="grid gap-4 xl:grid-cols-5">
         <section className="card xl:col-span-3">
           <h2 className="card-title">Website visits by channel, per week</h2>
-          <p className="muted mb-3 text-xs">AI assistants and Google Maps are split out from the usual GA4 channels. The last bar is the selected week.</p>
+          <p className="muted mb-3 text-xs">
+            AI assistants and Google Maps are split out from the usual GA4 channels.
+            {kind === "week" ? " The last bar is the selected week." : ` 7-day blocks ending ${format(curWin.ga4.end, "MMM d")}, the latest day with website data.`}
+          </p>
           <StackedWeeks data={channelWeeks} keys={activeChannels as unknown as string[]} />
         </section>
         <section className="card xl:col-span-2">
           <h2 className="card-title">Where visitors come from, and who becomes a lead</h2>
-          <p className="muted mb-3 text-xs">Selected week ({span(curWin)}).</p>
+          <p className="muted mb-3 text-xs tnum">{words.cur}: {fmtRange(curWin.ga4)}.</p>
           <Flow channels={flow} />
         </section>
       </div>
@@ -228,7 +246,7 @@ export default async function Performance({ searchParams }: { searchParams: { we
       <div className="grid gap-4 lg:grid-cols-2">
         <section className="card">
           <h2 className="card-title">AI assistants</h2>
-          <p className="muted mb-4 text-xs">Visits and leads by platform, selected week vs the week before.</p>
+          <p className="muted mb-4 text-xs tnum">Visits and leads by platform. Website: {dates("ga4")}.</p>
           {aiList.length ? (
             <div className="flex flex-col gap-3">
               {aiList.map((a) => (
@@ -237,7 +255,7 @@ export default async function Performance({ searchParams }: { searchParams: { we
                     <span className="font-semibold">{a.name}</span>
                     <span className="flex items-center gap-2 tnum">
                       {fmtNum(a.n)} visits · {fmtNum(aiLeads.get(a.name) || 0)} leads
-                      <span className="text-xs text-ink-muted">(week before: {fmtNum(a.p)} · {fmtNum(aiLeadsPrev.get(a.name) || 0)})</span>
+                      <span className="text-xs text-ink-muted">({words.prev.toLowerCase()}: {fmtNum(a.p)} · {fmtNum(aiLeadsPrev.get(a.name) || 0)})</span>
                       <Delta cur={a.n} prev={a.p} />
                     </span>
                   </div>
@@ -245,7 +263,7 @@ export default async function Performance({ searchParams }: { searchParams: { we
                 </div>
               ))}
             </div>
-          ) : <p className="muted text-sm">No AI visits in the selected week or the week before.</p>}
+          ) : <p className="muted text-sm">No AI visits in this period or the one before.</p>}
           <div className="mt-5">
             <p className="label">AI visits per week</p>
             <Lines data={aiWeekly} series={[{ key: "ai", name: "AI visits", color: "#F15D26" }]} height={160} />
@@ -254,7 +272,7 @@ export default async function Performance({ searchParams }: { searchParams: { we
 
         <section className="card">
           <h2 className="card-title">Google Search</h2>
-          <p className="muted mb-3 text-xs">Clicks per week by search type (weeks run 3 days earlier).</p>
+          <p className="muted mb-3 text-xs tnum">Clicks per week by search type. Search Console: {dates("gsc")}.</p>
           <Lines data={searchWeekly} series={[
             { key: "brand", name: "Searching “Newfore”", color: "#2C3338" },
             { key: "question", name: "Questions & long searches", color: "#F15D26" },
@@ -262,7 +280,10 @@ export default async function Performance({ searchParams }: { searchParams: { we
           ]} />
           <div className="mt-4 overflow-x-auto">
             <table className="w-full text-sm tnum">
-              <thead><tr className="text-left text-xs text-ink-muted"><th className="py-1.5">Key search</th><th className="text-right">This week</th><th className="text-right">Week before</th><th className="text-right">28 days</th><th className="text-right">Views this week</th></tr></thead>
+              <thead><tr className="text-left text-xs text-ink-muted">
+                <th className="py-1.5">Key search</th><th className="text-right">{words.cur}</th><th className="text-right">{words.prev}</th>
+                <th className="text-right">28 days</th><th className="text-right">Views ({words.cur.toLowerCase()})</th>
+              </tr></thead>
               <tbody>
                 {keywords.map((k) => {
                   const a = kwPos(cur, k), b = kwPos(prev, k), m = kwPos(d28, k), n = kwViews(cur, k);
@@ -284,28 +305,29 @@ export default async function Performance({ searchParams }: { searchParams: { we
 
       <section className="card">
         <h2 className="card-title">Google Maps, by location</h2>
-        <p className="muted mb-3 text-xs">
-          Selected week from the Business Profile API, with the change vs the week before. “Site visits” are GA4 sessions tagged with each profile’s UTM link.
-          “New this week” is the latest review count this week minus last week’s. “Reviews now” is the latest count by the end of the selected week,
-          compared with the count 28 days before it{rev28.anyFallback ? ", or with the oldest count we have until 28 days of history exist" : ""}.
+        <p className="muted mb-3 text-xs tnum">
+          Business Profile figures for Google Maps: {dates("gbp")}, with the change vs {words.prev.toLowerCase()}. “Site visits” are GA4 sessions tagged with each
+          profile’s UTM link (website dates). Reviews: {fmtRange({ start: day(revRange.start), end: day(revRange.end) })}
+          {sinceDates.length ? `, from ${format(day(sinceDates[0]), "MMM d")} where there’s no earlier count yet` : ""}.
         </p>
         <div className="overflow-x-auto">
-          <table className="w-full min-w-[1100px] text-sm tnum">
+          <table className="w-full min-w-[1200px] text-sm tnum">
             <thead>
               <tr className="text-left text-xs text-ink-muted">
                 <th className="py-2">Location</th>
                 {mapsCols.map((c) => <th key={c.label} className="text-right">{c.label}</th>)}
                 <th className="text-right">Reviews now</th>
-                <th className="text-right">{rev28.anyFallback ? `Since ${rev28.sinceLabel}` : "28 days ago"}</th>
-                <th className="text-right">{rev28.anyFallback ? `New since ${rev28.sinceLabel}` : "New (28 days)"}</th>
-                <th className="text-right">New this week</th><th className="text-right">Rating</th>
+                <th className="text-right">{startHeader}</th>
+                <th className="text-right" title={FLOW_NOTE}>Gained <span aria-hidden>ⓘ</span></th>
+                <th className="text-right" title={FLOW_NOTE}>Removed <span aria-hidden>ⓘ</span></th>
+                <th className="text-right">Net</th>
+                <th className="text-right" title="Net ÷ gained">Kept %</th>
+                <th className="text-right">Rating</th>
               </tr>
             </thead>
             <tbody>
               {locNames.length ? locNames.map((l) => {
-                const nr = newReviews(cur, lastWeekFull, l);
-                const r = rev28.byLoc.get(l);
-                const odd = r && r.fallback && rev28.mixedDates;
+                const f = flows.get(l);
                 return (
                   <tr key={l} className="border-t border-paper-line align-top">
                     <td className="py-2 font-semibold">{l}</td>
@@ -315,18 +337,20 @@ export default async function Performance({ searchParams }: { searchParams: { we
                         <div className="mt-0.5"><Delta cur={c.fn(cur, l)} prev={c.fn(prev, l)} /></div>
                       </td>
                     ))}
-                    <td className="py-2 text-right">{fmtNum(r?.now ?? null)}</td>
+                    <td className="py-2 text-right">{fmtNum(f?.now ?? null)}</td>
                     <td className="py-2 text-right text-ink-muted">
-                      {fmtNum(r?.past ?? null)}
-                      {odd && <div className="text-[11px]">{format(new Date(r!.pastDate + "T00:00:00"), "MMM d")}</div>}
+                      {fmtNum(f?.start ?? null)}
+                      {f?.fallback && sinceDates.length > 1 && <div className="text-[11px]">{format(day(f.startDate), "MMM d")}</div>}
                     </td>
-                    <td className="py-2 text-right"><NewBadge n={r?.diff ?? null} /></td>
-                    <td className="py-2 text-right">{nr === null ? "—" : `${nr > 0 ? "+" : ""}${fmtNum(nr)}`}</td>
-                    <td className="py-2 text-right">{fmtNum(snap(cur, "rating_snap", l), 1)}</td>
+                    <td className="py-2 text-right text-emerald-700" title={FLOW_NOTE}>{f ? `+${fmtNum(f.gained)}` : "—"}</td>
+                    <td className="py-2 text-right text-red-700" title={FLOW_NOTE}>{f ? fmtNum(f.removed) : "—"}</td>
+                    <td className="py-2 text-right">{f ? `${f.net > 0 ? "+" : ""}${fmtNum(f.net)}` : "—"}</td>
+                    <td className="py-2 text-right">{pct(f?.kept ?? null)}</td>
+                    <td className="py-2 text-right">{fmtNum(ratingNow(l), 1)}</td>
                   </tr>
                 );
               }) : (
-                <tr><td colSpan={mapsCols.length + 6} className="py-6 text-center text-ink-muted">No Maps data for this week. Choose your locations in Settings (needs Business Profile API access).</td></tr>
+                <tr><td colSpan={mapsCols.length + 8} className="py-6 text-center text-ink-muted">No Maps data for this period. Choose your locations in Settings (needs Business Profile API access).</td></tr>
               )}
               {locNames.length > 1 && (
                 <tr className="border-t-2 border-ink/20 align-top font-semibold">
@@ -340,16 +364,24 @@ export default async function Performance({ searchParams }: { searchParams: { we
                       </td>
                     );
                   })}
-                  <td className="py-2 text-right">{fmtNum(sumOf(locNames.map((l) => rev28.byLoc.get(l)?.now ?? null)))}</td>
-                  <td className="py-2 text-right text-ink-muted">{fmtNum(sumOf(locNames.map((l) => rev28.byLoc.get(l)?.past ?? null)))}</td>
-                  <td className="py-2 text-right"><NewBadge n={sumOf(locNames.map((l) => rev28.byLoc.get(l)?.diff ?? null))} /></td>
-                  <td className="py-2 text-right">{(() => { const n = sumOf(locNames.map((l) => newReviews(cur, lastWeekFull, l))); return n === null ? "—" : `${n > 0 ? "+" : ""}${fmtNum(n)}`; })()}</td>
+                  <td className="py-2 text-right">{fmtNum(total.now)}</td>
+                  <td className="py-2 text-right text-ink-muted">{fmtNum(total.start)}</td>
+                  <td className="py-2 text-right text-emerald-700" title={FLOW_NOTE}>{total.gained === null ? "—" : `+${fmtNum(total.gained)}`}</td>
+                  <td className="py-2 text-right text-red-700" title={FLOW_NOTE}>{fmtNum(total.removed)}</td>
+                  <td className="py-2 text-right">{totalNet === null ? "—" : `${totalNet > 0 ? "+" : ""}${fmtNum(totalNet)}`}</td>
+                  <td className="py-2 text-right">{pct(total.gained ? (totalNet ?? 0) / total.gained : null)}</td>
                   <td className="py-2 text-right" title="Average weighted by each location's review count">{fmtNum(ratingAll, 1)}</td>
                 </tr>
               )}
             </tbody>
           </table>
         </div>
+        <p className="mt-2 text-xs text-ink-muted">{FLOW_NOTE}</p>
+        {chartDays.length > 0 && Object.keys(byLoc).length > 0 && (
+          <div className="mt-4">
+            <ReviewFlowChart days={chartDays} byLoc={byLoc} />
+          </div>
+        )}
       </section>
     </div>
   );

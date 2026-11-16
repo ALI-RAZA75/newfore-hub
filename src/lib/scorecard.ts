@@ -10,6 +10,8 @@ export const SCORECARD: Measurable[] = [
   { key: "gbp_actions", label: "Google profile calls + website clicks + directions" },
   { key: "new_reviews", label: "New Google reviews (all locations)" },
   { key: "new_reviews_28d", label: "New Google reviews (28 days)" },
+  { key: "reviews_gained", label: "Reviews gained (week)" },
+  { key: "reviews_removed", label: "Reviews removed (week)", lowerIsBetter: true },
   { key: "gbp_posts", label: "Google profile posts published", manual: true },
   { key: "negative_reviews", label: "Negative reviews (1–3 stars)", lowerIsBetter: true, manual: true },
 ];

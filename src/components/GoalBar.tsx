@@ -1,14 +1,16 @@
 import clsx from "clsx";
 import { fmtNum } from "./Kpi";
 import { Spark } from "./charts";
-import { Agg, AGG_TEXT, Goal, goalStatus, isRate, WeekCtx } from "@/lib/goals";
+import { Agg, AGG_TEXT, Goal, goalStatus, isRate, periodTarget, WeekCtx } from "@/lib/goals";
 
 export type { Goal } from "@/lib/goals";
 
-/** One goal judged on the selected week: value, progress to the weekly target, 12-week trend. */
-export default function GoalBar({ goal, agg, value, ctx, spark = [], hits, counted, compact = false }: {
+/** One goal judged on the selected period: value, progress to its target, 12-week trend. */
+export default function GoalBar({ goal, agg, value, ctx, spark = [], hits, counted, compact = false, period = "this week" }: {
   goal: Goal; agg: Agg | null; value: number | null; ctx: WeekCtx;
   spark?: (number | null)[]; hits?: number; counted?: number; compact?: boolean;
+  /** How to name the period in text, e.g. "the last 7 days". */
+  period?: string;
 }) {
   const st = goalStatus(goal, agg, value, ctx);
   const dec = agg === "avg" ? 1 : 0;
@@ -26,14 +28,15 @@ export default function GoalBar({ goal, agg, value, ctx, spark = [], hits, count
       <div className="flex items-baseline gap-2 tnum">
         <span className={clsx("font-display font-extrabold", compact ? "text-2xl" : "text-3xl")}>{fmtNum(value, dec)}</span>
         <span className="text-xs text-ink-muted">
-          {isRate(agg) ? "this week" : "end of week"} · Weekly target: {fmtNum(goal.target, dec)}{goal.lower_is_better ? " (lower is better)" : ""}
+          {isRate(agg) ? `in ${period}` : `end of ${period}`} · {(ctx.len ?? 7) === 7 ? "Weekly target" : `Target (${ctx.len} days)`}:{" "}
+          {fmtNum(periodTarget(goal, agg, ctx), dec)}{goal.lower_is_better ? " (lower is better)" : ""}
         </span>
       </div>
       <div className="relative h-2 rounded-full bg-paper">
         <div className={clsx("h-2 rounded-full", st.tone === "bad" ? "bg-red-500" : st.tone === "warn" ? "bg-amber-500" : "bg-brand")} style={{ width: `${st.pct * 100}%` }} />
         {st.pace > 0 && st.pace < 1 && (
           <div className="absolute -top-1 h-4 w-0.5 rounded bg-ink/40" style={{ left: `calc(${st.pace * 100}% - 1px)` }}
-            title={isRate(agg) ? "Where we should be by now this week" : "Where we should be by the end of this week"} />
+            title={isRate(agg) ? `Where we should be by now in ${period}` : `Where we should be by the end of ${period}`} />
         )}
       </div>
       {spark.length > 1 && (
