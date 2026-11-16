@@ -2,11 +2,11 @@ import Link from "next/link";
 import { addDays, eachDayOfInterval, format, formatDistanceToNow, subDays } from "date-fns";
 import { getMe, supabaseServer } from "@/lib/supabase-server";
 import {
-  byDim, fmtRange, goalPeriod, loadPeriod, loadWeeks, METRICS, MRow, newReviewsAll, periodDates, periodQuery, pick, ReviewFlow, reviewFlow,
-  reviewFlowAll, reviews28All, reviewSnaps, rowsFor, snapAt, SOURCE_NAMES, SOURCES, window28,
+  byDim, fmtRange, goalPeriod, latestDates, loadPeriod, loadWeeks, METRICS, MRow, newReviewsAll, periodDates, periodQuery, pick, ReviewFlow, reviewFlow,
+  reviewFlowAll, reviews28All, reviewSnaps, rollingWindow, rowsFor, snapAt, SOURCE_NAMES, SOURCES, window28,
 } from "@/lib/metrics";
 import { CHANNELS } from "@/lib/classify";
-import { GOAL_SOURCE, MANUAL_SOURCE, SCORECARD } from "@/lib/scorecard";
+import { GOAL_SOURCE, goalFor, MANUAL_SOURCE, SCORECARD } from "@/lib/scorecard";
 import { weekEndOf } from "@/lib/goals";
 import Kpi, { Delta, fmtNum } from "@/components/Kpi";
 import LiveNow from "@/components/LiveNow";
@@ -41,13 +41,17 @@ export default async function Performance({ searchParams }: { searchParams: { we
   // Selected period (default: last 7 days, ending on each source's latest data) and its comparison
   const p = await loadPeriod(searchParams);
   const { cur, prev, curWin, prevWin, kind, len, days } = p;
-  const [d28, goalRows, snaps, ratings, sc] = await Promise.all([
+  const [d28, goalRows, snaps, ratings, sc, live] = await Promise.all([
     rowsFor(window28(curWin)),
     sb.from("metrics_daily").select("metric,value").eq("source", GOAL_SOURCE).then((r) => r.data || []),
     reviewSnaps(),
     reviewSnaps("rating_snap"),
     // The EOS scorecard always shows Mon–Sun weeks (the last 8 complete ones for rolling periods)
     p.weeks ? Promise.resolve(p.weeks) : loadWeeks(undefined, SCORE_WEEKS),
+    // Its "live" column: the rolling period (last 7 days when a week is selected)
+    kind === "week"
+      ? latestDates().then(async (l) => { const win = rollingWindow(l, 7); return { win, rows: await rowsFor(win), len: 7 }; })
+      : Promise.resolve({ win: curWin, rows: cur, len }),
   ]);
   const blockRows = p.blocks.rows.slice(1);
   const blockWins = p.blocks.wins.slice(1);
@@ -89,11 +93,32 @@ export default async function Performance({ searchParams }: { searchParams: { we
   const scLast = sc.rows.length - 1;
   const scoreIdx = Array.from({ length: SCORE_WEEKS }, (_, i) => scLast - SCORE_WEEKS + 1 + i);
   const scoreWeeks = scoreIdx.map((i) => ({ iso: sc.isos[i], range: `${format(sc.mondays[i], "MMM d")} – ${format(addDays(sc.mondays[i], 6), "MMM d")}` }));
-  const scoreRows: ScoreRow[] = SCORECARD.map((m) => ({
-    ...m,
-    goal: goalRows.find((g: any) => g.metric === m.key)?.value ?? null,
-    values: scoreIdx.map((i) => (m.manual ? manual(sc.rows[i], m.key) : scoreFn[m.key](sc.rows[i], sc.rows[i - 1], sc.isos[i]))),
-  }));
+  // Live column: reviews use their own window ending on the latest snapshot; hand-entered rows are weekly only
+  const liveSnapEnd = snaps.length ? snaps[snaps.length - 1].date : ymd(subDays(new Date(), 1));
+  const liveRev = { start: ymd(subDays(day(liveSnapEnd), live.len - 1)), end: liveSnapEnd };
+  const liveFlow = reviewFlowAll(snaps, liveRev.start, liveRev.end);
+  const liveSnapLocs = [...new Set(snaps.filter((x) => x.date >= liveRev.start && x.date <= liveRev.end).map((x) => x.dim))];
+  const liveValue = (key: string): number | null => {
+    if (key === "new_reviews") return liveFlow ? liveFlow.gained - liveFlow.removed : null;
+    if (key === "new_reviews_28d") return reviews28All(snaps, liveSnapLocs, liveRev.end);
+    if (key === "reviews_gained") return liveFlow?.gained ?? null;
+    if (key === "reviews_removed") return liveFlow?.removed ?? null;
+    return scoreFn[key](live.rows, [], "");
+  };
+  const liveColumn = {
+    label: `Last ${live.len} days (live)`,
+    title: `${SOURCES.map((src) => `${SOURCE_NAMES[src]}: ${fmtRange(live.win[src])}`).join(" · ")} · Reviews: ${fmtRange({ start: day(liveRev.start), end: day(liveRev.end) })}`,
+  };
+  const scoreRows: ScoreRow[] = SCORECARD.map((m) => {
+    const goal = goalRows.find((g: any) => g.metric === m.key)?.value ?? null;
+    return {
+      ...m,
+      goal,
+      values: scoreIdx.map((i) => (m.manual ? manual(sc.rows[i], m.key) : scoreFn[m.key](sc.rows[i], sc.rows[i - 1], sc.isos[i]))),
+      live: m.manual ? null : liveValue(m.key),
+      liveGoal: goalFor(m, goal, live.len),
+    };
+  });
 
   // Weekly visits by channel (7-day blocks ending with the period)
   const blockLabel = (i: number, src: "ga4" | "gsc") => format(blockWins[i][src].start, "MMM d");
@@ -198,7 +223,7 @@ export default async function Performance({ searchParams }: { searchParams: { we
         <div className="card border-brand/40 bg-brand-soft text-sm">This week has just started, so there’s no data for it yet. Pick “Last 7 days” or “Last week”.</div>
       )}
 
-      <Scorecard weeks={scoreWeeks} rows={scoreRows} isAdmin={me?.role === "admin"} />
+      <Scorecard weeks={scoreWeeks} rows={scoreRows} isAdmin={me?.role === "admin"} live={liveColumn} />
 
       <div className="grid gap-4 lg:grid-cols-3">
         <div className="lg:col-span-1"><LiveNow /></div>
