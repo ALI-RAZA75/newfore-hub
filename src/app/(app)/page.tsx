@@ -3,7 +3,7 @@ import { addDays, eachDayOfInterval, format, formatDistanceToNow, subDays } from
 import { getMe, supabaseServer } from "@/lib/supabase-server";
 import {
   byDim, fmtRange, goalPeriod, latestDates, loadPeriod, loadWeeks, METRICS, MRow, newReviewsAll, periodDates, periodQuery, pick, ReviewFlow, reviewFlow,
-  reviewFlowAll, reviews28All, reviewSnaps, rollingWindow, rowsFor, snapAt, SOURCE_NAMES, SOURCES, window28,
+  reviewFlowAll, reviews28All, reviewSnaps, rollingWindow, rowsFor, snapAt, SOURCE_NAMES, SOURCES, sumBetween,
 } from "@/lib/metrics";
 import { CHANNELS } from "@/lib/classify";
 import { GOAL_SOURCE, goalFor, MANUAL_SOURCE, SCORECARD } from "@/lib/scorecard";
@@ -41,8 +41,13 @@ export default async function Performance({ searchParams }: { searchParams: { we
   // Selected period (default: last 7 days, ending on each source's latest data) and its comparison
   const p = await loadPeriod(searchParams);
   const { cur, prev, curWin, prevWin, kind, len, days } = p;
-  const [d28, goalRows, snaps, ratings, sc, live] = await Promise.all([
-    rowsFor(window28(curWin)),
+  const [kw, goalRows, snaps, ratings, sc, live] = await Promise.all([
+    // Key searches always use the last 7 and 28 days ending on the latest Search Console date
+    latestDates().then(async ({ gsc: end }) => {
+      const r7 = { start: subDays(end, 6), end }, r28 = { start: subDays(end, 27), end };
+      const [a, b] = await Promise.all([sumBetween(r7.start, r7.end), sumBetween(r28.start, r28.end)]);
+      return { r7, r28, rows7: a.filter((r) => r.source === "gsc"), rows28: b.filter((r) => r.source === "gsc") };
+    }),
     sb.from("metrics_daily").select("metric,value").eq("source", GOAL_SOURCE).then((r) => r.data || []),
     reviewSnaps(),
     reviewSnaps("rating_snap"),
@@ -68,7 +73,7 @@ export default async function Performance({ searchParams }: { searchParams: { we
       : { cur: "This week", prev: "Week before", in: "this week" };
   const dates = (src: "ga4" | "gsc" | "gbp") => periodDates(p, src);
 
-  const hasData = p.blocks.rows.some((r) => r.length > 0) || d28.length > 0;
+  const hasData = p.blocks.rows.some((r) => r.length > 0) || kw.rows28.length > 0;
   const v = (rows: MRow[], key: string) => METRICS[key].fn(rows, { keywords });
   const series = (key: string) => blockRows.map((rows) => v(rows, key));
   const profileActions = (rows: MRow[]) => pick(rows, "gbp", "calls") + pick(rows, "gbp", "website_clicks") + pick(rows, "gbp", "directions");
@@ -191,6 +196,10 @@ export default async function Performance({ searchParams }: { searchParams: { we
     return imp ? pick(rows, "gsc", "kw_posw", k.toLowerCase()) / imp : null;
   };
   const kwViews = (rows: MRow[], k: string) => pick(rows, "gsc", "kw_impr", k.toLowerCase());
+  const keyRows = keywords
+    .map((k) => ({ k, p7: kwPos(kw.rows7, k), p28: kwPos(kw.rows28, k), views: kwViews(kw.rows28, k) }))
+    .sort((a, b) => b.views - a.views);
+  const hasKw = kw.rows28.length > 0;
 
   return (
     <div className="mx-auto flex max-w-7xl flex-col gap-6">
@@ -304,21 +313,28 @@ export default async function Performance({ searchParams }: { searchParams: { we
             { key: "short", name: "Short non-brand", color: "#3B6FD8" },
           ]} />
           <div className="mt-4 overflow-x-auto">
+            <p className="muted mb-1 text-xs tnum">
+              Search Console: last 7 days {fmtRange(kw.r7)} · last 28 days {fmtRange(kw.r28)}. Average position, lower is better; ✓ = top 5.
+            </p>
             <table className="w-full text-sm tnum">
               <thead><tr className="text-left text-xs text-ink-muted">
-                <th className="py-1.5">Key search</th><th className="text-right">{words.cur}</th><th className="text-right">{words.prev}</th>
-                <th className="text-right">28 days</th><th className="text-right">Views ({words.cur.toLowerCase()})</th>
+                <th className="py-1.5">Key search</th><th className="text-right">Last 7 days</th>
+                <th className="text-right">Last 28 days</th><th className="text-right">Views (28 days)</th>
               </tr></thead>
               <tbody>
-                {keywords.map((k) => {
-                  const a = kwPos(cur, k), b = kwPos(prev, k), m = kwPos(d28, k), n = kwViews(cur, k);
+                {keyRows.map(({ k, p7, p28, views }) => {
+                  // Lower is better: 1+ places better than the 28-day average is an improvement
+                  const trend = p7 !== null && p28 !== null ? (p28 - p7 >= 1 ? "up" : p7 - p28 >= 1 ? "down" : null) : null;
                   return (
                     <tr key={k} className="border-t border-paper-line">
                       <td className="py-1.5">{k}</td>
-                      <td className="text-right font-semibold">{a ? fmtNum(a, 1) : <span className="font-normal text-ink-muted">no views</span>}{a && a <= 5 ? " ✓" : ""}</td>
-                      <td className="text-right text-ink-muted">{b ? fmtNum(b, 1) : "—"}</td>
-                      <td className="text-right">{m ? fmtNum(m, 1) : "—"}</td>
-                      <td className="text-right text-ink-muted">{has(cur, "gsc") ? fmtNum(n) : "—"}</td>
+                      <td className="text-right font-semibold">
+                        {trend === "up" && <span className="mr-1 text-emerald-600" title={`Better than the 28-day position (${fmtNum(p28, 1)})`}>↑</span>}
+                        {trend === "down" && <span className="mr-1 text-red-600" title={`Worse than the 28-day position (${fmtNum(p28, 1)})`}>↓</span>}
+                        {p7 ? fmtNum(p7, 1) : <span className="font-normal text-ink-muted">no views</span>}{p7 && p7 <= 5 ? " ✓" : ""}
+                      </td>
+                      <td className="text-right">{p28 ? <>{fmtNum(p28, 1)}{p28 <= 5 ? " ✓" : ""}</> : <span className="text-ink-muted">no views</span>}</td>
+                      <td className="text-right text-ink-muted">{hasKw ? fmtNum(views) : "—"}</td>
                     </tr>
                   );
                 })}
